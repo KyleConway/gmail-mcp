@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Fails when a README advertises a different number of tools or tests than the
-source actually has. Both numbers appear in every language, so a change to
-either drifts silently across nine places otherwise.
+"""Fails when the docs advertise a different number of tools or tests than the
+source actually has. Both numbers appear in the README and in the guide the
+Worker serves, so a change to either drifts silently otherwise.
 
 With --fix, rewrites the claims instead of reporting them. Editing the numbers
 by searching for the digits rewrites whatever else happens to contain them: a
@@ -14,18 +14,20 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-READMES = ["README.md", "README.ja.md", "README.zh.md"]
+DOCS = ["README.md", "docs/index.html"]
 
 # Patterns whose single capture group is a count claimed about this project.
 # Third-party columns of the comparison table are deliberately not matched.
 TEST_CLAIMS = [
     r"tests-(\d+)_passing",
     r"(\d+) unit tests",
-    r"(\d+)件の単体テスト",
-    r"単体テスト(\d+)件",
-    r"(\d+)个单元测试",
+    r"(\d+) tests passing",
 ]
-TOOL_CLAIMS = [r"badge/tools-(\d+)-"]
+TOOL_CLAIMS = [
+    r"badge/tools-(\d+)-",
+    r"\[!\[(\d+) tools\]",
+    r">(\d+) tools<",
+]
 
 
 def actual_tools() -> int:
@@ -46,7 +48,7 @@ def actual_tests() -> int:
 
 def fix(expected: int, patterns: list[str]) -> list[str]:
     changed = []
-    for name in READMES:
+    for name in DOCS:
         path = ROOT / name
         text = original = path.read_text(encoding="utf-8")
         for pattern in patterns:
@@ -65,7 +67,7 @@ def fix(expected: int, patterns: list[str]) -> list[str]:
 
 def check(label: str, expected: int, patterns: list[str]) -> list[str]:
     problems = []
-    for name in READMES:
+    for name in DOCS:
         text = (ROOT / name).read_text(encoding="utf-8")
         for pattern in patterns:
             for claimed in re.findall(pattern, text):

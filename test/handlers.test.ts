@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import "./runtime-shim";
+import { signData } from "../src/workers-oauth-utils";
 
 const { GmailMCP, default: worker } = await import("../src/index");
+
+// Signs the file addresses a session hands out, and is what the Worker checks
+// them against.
+const COOKIE_KEY = "cookie-secret";
 
 type Handler = (args: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
 type Route = (url: string, init: RequestInit) => unknown;
@@ -44,10 +52,17 @@ function serveGmail(routes: [RegExp, Route][]) {
 
 function makeAgent(email = "me@example.com") {
 	const handlers = new Map<string, Handler>();
+	// What each tool declared beside its schema, when it declared anything.
+	const annotations = new Map<string, Record<string, unknown> | undefined>();
 	const storage = new Map<string, unknown>();
 	const agent = Object.create(GmailMCP.prototype) as Record<string, unknown>;
 	agent.server = {
-		tool: (name: string, _d: string, _s: unknown, cb: Handler) => handlers.set(name, cb),
+		// The handler always comes last; annotations sit between it and the
+		// schema when a tool passes them.
+		tool: (name: string, ...rest: unknown[]) => {
+			handlers.set(name, rest[rest.length - 1] as Handler);
+			annotations.set(name, rest.length === 4 ? (rest[2] as Record<string, unknown>) : undefined);
+		},
 	};
 	agent.props = {
 		email,
@@ -70,14 +85,49 @@ function makeAgent(email = "me@example.com") {
 			},
 		},
 	};
-	agent.env = { GOOGLE_CLIENT_ID: "id", GOOGLE_CLIENT_SECRET: "secret" };
-	return { agent, handlers, storage };
+	agent.env = {
+		GOOGLE_CLIENT_ID: "id",
+		GOOGLE_CLIENT_SECRET: "secret",
+		COOKIE_ENCRYPTION_KEY: COOKIE_KEY,
+	};
+	return { agent, handlers, annotations, storage };
 }
 
 async function boot(email?: string) {
 	const made = makeAgent(email);
 	await (made.agent as { init: () => Promise<void> }).init();
 	return made;
+}
+
+/**
+ * What the public file routes run against: a session namespace that records
+ * every name an object is started under and hands whatever reaches one to
+ * serve, and a limiter that records every caller it counts.
+ */
+function fileRouteEnv(
+	serve: (request: Request) => Promise<Response> = async () => new Response("reached"),
+) {
+	const woken: string[] = [];
+	const limited: string[] = [];
+	const env = {
+		COOKIE_ENCRYPTION_KEY: COOKIE_KEY,
+		MCP_OBJECT: {
+			idFromName: (name: string) => ({ name }),
+			get: () => ({
+				setName: async (name: string) => {
+					woken.push(name);
+				},
+				fetch: serve,
+			}),
+		},
+		REGISTER_LIMITER: {
+			limit: async ({ key }: { key: string }) => {
+				limited.push(key);
+				return { success: true };
+			},
+		},
+	};
+	return { env: env as never, woken, limited };
 }
 
 /** A handler that must exist, so a missing one fails loudly rather than quietly. */
@@ -211,6 +261,23 @@ describe("search_messages", () => {
 		await tool(handlers, "search_messages")({ query: "x", maxResults: 1 });
 		expect(requests.some((r) => r.url.includes("metadataHeaders=Cc"))).toBe(true);
 	});
+
+	// A reply follows Reply-To, so a search that leaves it out shows the sender
+	// while hiding where an answer to them would go.
+	test("asks Gmail for Reply-To and Bcc, and reports them", async () => {
+		const { handlers } = await boot();
+		const routed = message("m1");
+		routed.payload.headers.push({ name: "Reply-To", value: "billing@evil.example" });
+		serveGmail([
+			[/\/messages\?/, () => ({ messages: [{ id: "m1" }] })],
+			[/\/messages\/m1/, () => routed],
+		]);
+		const out = result(await tool(handlers, "search_messages")({ query: "x", maxResults: 1 }));
+		const fetched = requests.find((r) => r.url.includes("/messages/m1"))?.url ?? "";
+		expect(fetched).toContain("metadataHeaders=Reply-To");
+		expect(fetched).toContain("metadataHeaders=Bcc");
+		expect((out.messages as Record<string, unknown>[])[0]?.replyTo).toBe("billing@evil.example");
+	});
 });
 
 describe("send_message", () => {
@@ -255,6 +322,9 @@ describe("send_message", () => {
 });
 
 describe("reply_all", () => {
+	const everyone = ["alice@example.com", "bob@example.com", "carol@example.com"];
+	const sends = () => requests.filter((r) => r.url.includes("/messages/send"));
+
 	test("answers the sender, keeps the others, drops this account", async () => {
 		const { handlers } = await boot();
 		serveGmail([
@@ -262,9 +332,155 @@ describe("reply_all", () => {
 			[/\/messages\/m1\?format=full/, () => message("m1")],
 			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
 		]);
-		const out = result(await tool(handlers, "reply_all")({ messageId: "m1", body: "ok" }));
+		const out = result(
+			await tool(handlers, "reply_all")({ messageId: "m1", recipients: everyone, body: "ok" }),
+		);
 		expect(out.to).toEqual(["alice@example.com"]);
 		expect(out.cc).toEqual(["bob@example.com", "carol@example.com"]);
+	});
+
+	// The approval a send can wait on shows its arguments, and who a reply
+	// reaches is worked out here. Asking for the list puts it in front of the
+	// person approving; one that leaves someone out names them all and sends
+	// nothing.
+	test("refuses a list that differs, naming everyone the reply would reach", async () => {
+		const { handlers } = await boot();
+		serveGmail([
+			[/\/settings\/sendAs/, () => ({ sendAs: [{ sendAsEmail: "me@example.com" }] })],
+			[/\/messages\/m1\?format=full/, () => message("m1")],
+			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
+		]);
+		const reply = tool(handlers, "reply_all");
+		await expect(
+			reply({ messageId: "m1", recipients: ["alice@example.com"], body: "ok" }),
+		).rejects.toThrow("this would reach alice@example.com, bob@example.com, carol@example.com");
+		await expect(
+			reply({ messageId: "m1", recipients: [...everyone, "extra@example.com"], body: "ok" }),
+		).rejects.toThrow(/nothing was sent/);
+		expect(sends()).toHaveLength(0);
+	});
+
+	test("compares mailboxes, not the way they are spelled", async () => {
+		const { handlers } = await boot();
+		serveGmail([
+			[/\/settings\/sendAs/, () => ({ sendAs: [{ sendAsEmail: "me@example.com" }] })],
+			[/\/messages\/m1\?format=full/, () => message("m1")],
+			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
+		]);
+		await tool(
+			handlers,
+			"reply_all",
+		)({
+			messageId: "m1",
+			recipients: ["carol@example.com", "Alice@Example.COM", "bob+reports@example.com"],
+			body: "ok",
+		});
+		expect(sends()).toHaveLength(1);
+	});
+
+	// Business email compromise: the name and From are the client's, and the
+	// Reply-To is the attacker's. Following Reply-To is right, but nothing
+	// showed it before the mail went; now it has to be named to be sent.
+	test("follows Reply-To, and will not send until that address is named", async () => {
+		const { handlers } = await boot();
+		const redirected = message("m1");
+		redirected.payload.headers = [
+			{ name: "From", value: "Pat Client <pat@client.example>" },
+			{ name: "Reply-To", value: "pat.client.billing@evil.example" },
+			{ name: "To", value: "me@example.com" },
+			{ name: "Subject", value: "Signed agreement" },
+		];
+		serveGmail([
+			[/\/settings\/sendAs/, () => ({ sendAs: [{ sendAsEmail: "me@example.com" }] })],
+			[/\/messages\/m1\?format=full/, () => redirected],
+			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
+		]);
+		const read = result(await tool(handlers, "get_message")({ messageId: "m1" }));
+		expect(read.replyTo).toBe("pat.client.billing@evil.example");
+
+		await expect(
+			tool(
+				handlers,
+				"reply_all",
+			)({
+				messageId: "m1",
+				recipients: ["pat@client.example"],
+				body: "Attached.",
+			}),
+		).rejects.toThrow("this would reach pat.client.billing@evil.example.");
+		expect(sends()).toHaveLength(0);
+
+		await tool(
+			handlers,
+			"reply_all",
+		)({ messageId: "m1", recipients: ["pat.client.billing@evil.example"], body: "Attached." });
+		expect(sentMime("/messages/send")).toContain("To: pat.client.billing@evil.example");
+	});
+
+	// A tag folds away to compare mailboxes, so one entry could carry the
+	// client's whole address before the attacker's domain and still match,
+	// with the approval showing the client's address inside it.
+	test("refuses a stated recipient that is more than one bare address", async () => {
+		const { handlers } = await boot();
+		const redirected = message("m1");
+		redirected.payload.headers = [
+			{ name: "From", value: "Pat Client <pat.client@client.example>" },
+			{ name: "Reply-To", value: "pat.client.billing@gmail.com" },
+			{ name: "To", value: "me@example.com" },
+			{ name: "Subject", value: "Signed agreement" },
+		];
+		serveGmail([
+			[/\/settings\/sendAs/, () => ({ sendAs: [{ sendAsEmail: "me@example.com" }] })],
+			[/\/messages\/m1\?format=full/, () => redirected],
+			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
+		]);
+		for (const recipient of [
+			"patclientbilling+pat.client@client.example@gmail.com",
+			"Pat <pat.client.billing@gmail.com>",
+			"pat.client.billing@gmail.com, pat.client@client.example",
+		]) {
+			await expect(
+				tool(
+					handlers,
+					"reply_all",
+				)({ messageId: "m1", recipients: [recipient], body: "Attached." }),
+			).rejects.toThrow(/one bare address per entry/);
+		}
+		expect(sends()).toHaveLength(0);
+	});
+
+	// A display name is text the sender chose, and the reply goes to the
+	// address after it, as a mail server would deliver it.
+	test("answers the address, not one written inside a display name", async () => {
+		const { handlers } = await boot();
+		const named = message("m1");
+		named.payload.headers = [
+			{ name: "From", value: '"Pat Client <spy@evil.example>" <pat@client.example>' },
+			{ name: "To", value: "me@example.com" },
+			{ name: "Cc", value: "boss@client.example (<spy@evil.example>)" },
+			{ name: "Subject", value: "Signed agreement" },
+		];
+		serveGmail([
+			[/\/settings\/sendAs/, () => ({ sendAs: [{ sendAsEmail: "me@example.com" }] })],
+			[/\/messages\/m1\?format=full/, () => named],
+			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
+		]);
+		const out = result(
+			await tool(
+				handlers,
+				"reply_all",
+			)({
+				messageId: "m1",
+				recipients: ["pat@client.example", "boss@client.example"],
+				body: "ok",
+			}),
+		);
+		expect(out.to).toEqual(["pat@client.example"]);
+		expect(out.cc).toEqual(["boss@client.example"]);
+		const headers = sentMime("/messages/send").split("\r\n\r\n")[0] ?? "";
+		expect(headers).toContain("To: pat@client.example");
+		expect(headers).toContain("Cc: boss@client.example");
+		expect(headers).not.toContain("spy@evil.example");
 	});
 
 	// Every threading value on the original is written by whoever sent it, and
@@ -285,7 +501,12 @@ describe("reply_all", () => {
 			[/\/messages\/m1\?format=full/, () => hostile],
 			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
 		]);
-		const out = result(await tool(handlers, "reply_all")({ messageId: "m1", body: "ok" }));
+		const out = result(
+			await tool(
+				handlers,
+				"reply_all",
+			)({ messageId: "m1", recipients: ["bob@example.com"], body: "ok" }),
+		);
 		expect(out.to).toEqual(["bob@example.com"]);
 
 		const sent = requests.find((r) => r.url.includes("/messages/send"));
@@ -316,10 +537,14 @@ describe("reply_all from a send-as alias", () => {
 			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
 		]);
 
+	const recipients = ["alice@example.com", "bob@example.com"];
+
 	test("keeps the alias out of the reply and answers from it", async () => {
 		const { handlers } = await boot();
 		serve();
-		const out = result(await tool(handlers, "reply_all")({ messageId: "m1", body: "ok" }));
+		const out = result(
+			await tool(handlers, "reply_all")({ messageId: "m1", recipients, body: "ok" }),
+		);
 		expect(out.to).toEqual(["alice@example.com"]);
 		expect(out.cc).toEqual(["bob@example.com"]);
 
@@ -332,8 +557,8 @@ describe("reply_all from a send-as alias", () => {
 	test("reads the identities once and remembers them", async () => {
 		const { handlers } = await boot();
 		serve();
-		await tool(handlers, "reply_all")({ messageId: "m1", body: "one" });
-		await tool(handlers, "reply_all")({ messageId: "m1", body: "two" });
+		await tool(handlers, "reply_all")({ messageId: "m1", recipients, body: "one" });
+		await tool(handlers, "reply_all")({ messageId: "m1", recipients, body: "two" });
 		expect(requests.filter((r) => r.url.includes("/settings/sendAs"))).toHaveLength(1);
 	});
 });
@@ -372,6 +597,9 @@ describe("create_draft as a reply", () => {
 		);
 		expect(out.draftId).toBe("d1");
 		expect(out.threadId).toBe("t-m1");
+		// The whole envelope, since sending the draft later reaches all of it.
+		expect(out.to).toBe("alice@example.com");
+		expect(out.cc).toBe("bob@example.com, carol@example.com");
 
 		const created = requests.find((r) => r.url.endsWith("/drafts"));
 		const posted = (created?.body ?? {}) as { message?: { threadId?: string } };
@@ -423,10 +651,62 @@ describe("create_draft as a reply", () => {
 		expect(mime).not.toContain("Cc:");
 	});
 
+	// "Draft a reply and cc my partner" passes a Cc and no To. Replacing that Cc
+	// with the original's audience dropped the partner and copied a public list
+	// on what was meant to stay internal.
+	test("keeps a Cc the caller wrote when the To is derived", async () => {
+		const { handlers } = await boot();
+		const toList = message("m1");
+		toList.payload.headers = [
+			{ name: "From", value: "Alice <alice@client.example>" },
+			{ name: "To", value: "me@example.com, vendor-list@public.example" },
+			{ name: "Subject", value: "Pricing" },
+		];
+		serveGmail([
+			[/\/settings\/sendAs/, () => ({ sendAs: [{ sendAsEmail: "me@example.com" }] })],
+			[/\/messages\/m1\?format=full/, () => toList],
+			[/\/drafts$/, () => ({ id: "d1", message: { id: "dm1", threadId: "t-m1" } })],
+		]);
+		const out = result(
+			await tool(
+				handlers,
+				"create_draft",
+			)({ replyToMessageId: "m1", cc: "boss@me-company.example", body: "internal pricing" }),
+		);
+		const mime = sentMime("/drafts");
+		expect(mime).toContain("To: alice@client.example");
+		expect(mime).toContain("Cc: boss@me-company.example");
+		expect(mime).not.toContain("vendor-list@public.example");
+		expect(out).toMatchObject({ to: "alice@client.example", cc: "boss@me-company.example" });
+	});
+
 	test("a fresh draft still needs its recipients spelled out", async () => {
 		const { handlers } = await boot();
 		serveGmail([]);
 		await expect(tool(handlers, "create_draft")({ body: "b" })).rejects.toThrow(/replyToMessageId/);
+	});
+
+	test("a fresh draft reports everyone it will reach", async () => {
+		const { handlers } = await boot();
+		serveGmail([[/\/drafts$/, () => ({ id: "d1", message: { id: "dm1" } })]]);
+		const out = result(
+			await tool(
+				handlers,
+				"create_draft",
+			)({
+				to: "a@example.com",
+				cc: "c@example.com",
+				bcc: "hidden@example.com",
+				subject: "s",
+				body: "b",
+			}),
+		);
+		expect(out).toMatchObject({
+			draftId: "d1",
+			to: "a@example.com",
+			cc: "c@example.com",
+			bcc: "hidden@example.com",
+		});
 	});
 });
 
@@ -477,6 +757,7 @@ describe("update_draft", () => {
 		serve();
 		const out = result(await tool(handlers, "update_draft")({ draftId: "d1", body: "new text" }));
 		expect(out.attachments).toEqual(["main.docx"]);
+		expect(out).toMatchObject({ to: "prof@example.com", cc: "assistant@example.com" });
 
 		const put = requests.find((r) => r.method === "PUT");
 		const posted = (put?.body ?? {}) as { message?: { threadId?: string } };
@@ -524,6 +805,224 @@ describe("update_draft", () => {
 			/could not be read back/,
 		);
 		expect(requests.filter((r) => r.method === "PUT")).toHaveLength(0);
+	});
+
+	// An address header goes back as Gmail holds it. Decoded first, a display
+	// name's comma split the list, so a name carrying an address became a
+	// recipient of a draft whose owner only asked for the text to be tidied.
+	const word = (s: string) =>
+		`=?UTF-8?B?${btoa(String.fromCharCode(...new TextEncoder().encode(s)))}?=`;
+	const addressedAs = (headers: { name: string; value: string }[]) =>
+		serveGmail([
+			[
+				/\/drafts\/d1\?format=full/,
+				() => ({
+					id: "d1",
+					message: {
+						id: "dm1",
+						payload: {
+							mimeType: "text/plain",
+							headers: [...headers, { name: "Subject", value: "s" }],
+							body: { data: b64url("old text") },
+						},
+					},
+				}),
+			],
+			[/\/drafts\/d1$/, () => ({ id: "d1", message: { id: "dm2" } })],
+		]);
+
+	test("never turns an encoded display name into a recipient", async () => {
+		const { handlers } = await boot();
+		const crafted = `${word("spy@evil.example, Jöhn Smith")} <john@company.example>`;
+		addressedAs([
+			{ name: "To", value: crafted },
+			{ name: "Bcc", value: `${word("spy2@evil.example, Ann")} <ann@company.example>` },
+		]);
+		const out = result(await tool(handlers, "update_draft")({ draftId: "d1", body: "polished" }));
+		const headers = (sentMime("/drafts/d1", "PUT").split("\r\n\r\n")[0] ?? "").replace(
+			/\r\n[ \t]+/g,
+			" ",
+		);
+		expect(headers).toContain(`To: ${crafted}\r\n`);
+		expect(headers).not.toContain("spy@evil.example");
+		expect(headers).not.toContain("spy2@evil.example");
+		expect(out.to).toBe(crafted);
+	});
+
+	// Exchange directories write names as "Last, First". This server encodes a
+	// non-ASCII one into a single word, which an update used to split in two.
+	test("keeps a non-ASCII Last, First name whole", async () => {
+		const { handlers } = await boot();
+		const written = `${word("Doe, Jöhn")} <john@x.example>`;
+		addressedAs([{ name: "To", value: written }]);
+		await tool(handlers, "update_draft")({ draftId: "d1", body: "b" });
+		expect(sentMime("/drafts/d1", "PUT")).toContain(`To: ${written}\r\n`);
+	});
+
+	// Gmail can hand a long header back folded; the fold is not part of it.
+	test("unfolds an address header before rebuilding with it", async () => {
+		const { handlers } = await boot();
+		addressedAs([{ name: "To", value: "a@example.com,\r\n b@example.com" }]);
+		const out = result(await tool(handlers, "update_draft")({ draftId: "d1", body: "b" }));
+		expect(out.to).toBe("a@example.com, b@example.com");
+		expect(sentMime("/drafts/d1", "PUT")).toContain("To: a@example.com, b@example.com");
+	});
+});
+
+describe("send_draft", () => {
+	const draftWith = (headers: { name: string; value: string }[]) => () => ({
+		id: "d1",
+		message: { id: "dm1", payload: { headers } },
+	});
+	const sends = () => requests.filter((r) => r.url.includes("/drafts/send"));
+	const serve = (headers: { name: string; value: string }[]) =>
+		serveGmail([
+			[/\/drafts\/d1\?format=metadata/, draftWith(headers)],
+			[/\/drafts\/send/, () => ({ id: "sent", threadId: "t1", labelIds: ["SENT"] })],
+		]);
+	const withBcc = [
+		{ name: "To", value: "Alice <alice@x.example>" },
+		{ name: "Cc", value: "c@x.example" },
+		{ name: "Bcc", value: "spy@evil.example" },
+	];
+
+	// A draft carries whatever was last written to it, Bcc included, while the
+	// approval a send waited on showed only an opaque id.
+	test("refuses a list that leaves out the Bcc, and names it", async () => {
+		const { handlers } = await boot();
+		serve(withBcc);
+		await expect(
+			tool(
+				handlers,
+				"send_draft",
+			)({ draftId: "d1", recipients: ["alice@x.example", "c@x.example"] }),
+		).rejects.toThrow("this would reach alice@x.example, c@x.example, spy@evil.example.");
+		expect(sends()).toHaveLength(0);
+		expect(requests[0]?.url).toContain("metadataHeaders=Bcc");
+	});
+
+	test("sends once everyone on it is named", async () => {
+		const { handlers } = await boot();
+		serve(withBcc);
+		const out = result(
+			await tool(
+				handlers,
+				"send_draft",
+			)({ draftId: "d1", recipients: ["spy@evil.example", "C@x.example", "alice@x.example"] }),
+		);
+		expect(out.id).toBe("sent");
+		expect(sends().map((r) => r.body)).toEqual([{ id: "d1" }]);
+	});
+
+	// Gmail delivers "<alice@x.example>" <spy@evil.example> to spy, and this
+	// server used to read it as alice, so a list naming alice let spy have the
+	// mail. Neither reading can be trusted to match Gmail's, so neither passes.
+	test("refuses a recipient whose name could pass for another address", async () => {
+		const { handlers } = await boot();
+		serve([
+			{ name: "To", value: "alice@x.example" },
+			{ name: "Bcc", value: '"<alice@x.example>" <spy@evil.example>' },
+		]);
+		for (const recipients of [["alice@x.example"], ["alice@x.example", "spy@evil.example"]]) {
+			await expect(tool(handlers, "send_draft")({ draftId: "d1", recipients })).rejects.toThrow(
+				/more than one address/,
+			);
+		}
+		expect(sends()).toHaveLength(0);
+	});
+
+	// Receivers join a bare address to what sits beside it, so this draft goes
+	// to boss@company.com.evil.example while it reads as boss@company.com.
+	test("refuses a bare address with more joined to it", async () => {
+		const { handlers } = await boot();
+		serve([{ name: "To", value: "boss@company.com(c).evil.example" }]);
+		await expect(
+			tool(handlers, "send_draft")({ draftId: "d1", recipients: ["boss@company.com"] }),
+		).rejects.toThrow(/more than one address/);
+		expect(sends()).toHaveLength(0);
+	});
+
+	// A client other than this server may write a field twice.
+	test("counts a field written twice", async () => {
+		const { handlers } = await boot();
+		serve([
+			{ name: "To", value: "a@x.example" },
+			{ name: "Bcc", value: "b@x.example" },
+			{ name: "Bcc", value: "spy@evil.example" },
+		]);
+		await expect(
+			tool(handlers, "send_draft")({ draftId: "d1", recipients: ["a@x.example", "b@x.example"] }),
+		).rejects.toThrow(/spy@evil\.example/);
+		expect(sends()).toHaveLength(0);
+	});
+});
+
+describe("list_drafts", () => {
+	// Sending a draft reaches its Cc and Bcc as well as its To, and answers to
+	// it go to its Reply-To; a listing that shows only To hides all three.
+	test("shows everyone a draft reaches and where answers to it go", async () => {
+		const { handlers } = await boot();
+		serveGmail([
+			[/\/drafts\?/, () => ({ drafts: [{ id: "d1" }] })],
+			[
+				/\/drafts\/d1\?format=metadata/,
+				() => ({
+					id: "d1",
+					message: {
+						id: "dm1",
+						payload: {
+							headers: [
+								{ name: "To", value: "alice@x.example" },
+								{ name: "Cc", value: "c@x.example" },
+								{ name: "Bcc", value: "spy2@evil.example" },
+								{ name: "Reply-To", value: "answers@evil.example" },
+								{ name: "Subject", value: "s" },
+							],
+						},
+					},
+				}),
+			],
+		]);
+		const out = result(await tool(handlers, "list_drafts")({ maxResults: 10 }));
+		expect((out.drafts as Record<string, unknown>[])[0]).toMatchObject({
+			draftId: "d1",
+			to: "alice@x.example",
+			cc: "c@x.example",
+			bcc: "spy2@evil.example",
+			replyTo: "answers@evil.example",
+		});
+		const read = requests.find((r) => r.url.includes("/drafts/d1"))?.url ?? "";
+		expect(read).toContain("metadataHeaders=Bcc");
+		expect(read).toContain("metadataHeaders=Reply-To");
+	});
+});
+
+describe("the label tools", () => {
+	// Trash and Spam are emptied after 30 days, and one batch call reaches a
+	// thousand messages. Disposal goes through the tools named for it.
+	test.each([
+		["modify_labels", { messageId: "m1", addLabelIds: ["TRASH"] }],
+		["modify_thread_labels", { threadId: "t1", addLabelIds: ["STARRED", "SPAM"] }],
+		["batch_modify_messages", { messageIds: ["m1", "m2"], addLabelIds: ["trash"] }],
+	])("%s will not trash or mark spam", async (name, args) => {
+		const { handlers } = await boot();
+		serveGmail([[/./, () => ({})]]);
+		await expect(tool(handlers, name)({ removeLabelIds: [], ...args })).rejects.toThrow(
+			/trash_message or trash_thread/,
+		);
+		expect(requests).toHaveLength(0);
+	});
+
+	test("still files and archives, and can take mail out of the trash", async () => {
+		const { handlers } = await boot();
+		serveGmail([[/\/messages\/m1\/modify/, () => ({ id: "m1", labelIds: ["STARRED"] })]]);
+		await tool(
+			handlers,
+			"modify_labels",
+		)({ messageId: "m1", addLabelIds: ["STARRED"], removeLabelIds: ["INBOX", "TRASH"] });
+		expect(requests.map((r) => r.body)).toEqual([
+			{ addLabelIds: ["STARRED"], removeLabelIds: ["INBOX", "TRASH"] },
+		]);
 	});
 });
 
@@ -638,6 +1137,29 @@ describe("staged attachments", () => {
 			),
 		);
 		expect(response.status).toBe(404);
+	});
+
+	// The Worker checks the secret against the address before it wakes the
+	// session, so what stage_attachment_begin mints has to pass that check.
+	test("an upload URL reaches its staging through the public route, once", async () => {
+		const { agent, handlers } = await boot();
+		serveGmail([]);
+		(agent as { origin: string }).origin = "https://gmail.example.com";
+		const doFetch = (agent as { fetch: (r: Request) => Promise<Response> }).fetch.bind(agent);
+		const { uploadUrl } = (await begin(handlers)) as { uploadUrl?: string };
+		const url = String(uploadUrl);
+		expect(url).toStartWith(
+			`https://gmail.example.com/upload/${encodeURIComponent("streamable-http:session-1")}/`,
+		);
+
+		const { env, woken } = fileRouteEnv(doFetch);
+		const put = (body: string) =>
+			worker.fetch(new Request(url, { method: "PUT", body }), env, {} as never);
+		const response = await put("raw file bytes");
+		expect(response.status).toBe(200);
+		expect(((await response.json()) as { size: number }).size).toBe(14);
+		expect(woken).toEqual(["streamable-http:session-1"]);
+		expect((await put("other bytes")).status).toBe(409);
 	});
 
 	test("expired stagings are swept when a new one begins", async () => {
@@ -795,20 +1317,109 @@ describe("download links", () => {
 		);
 	});
 
+	const servesZip = (): [RegExp, Route][] => [
+		[/\/messages\/m1\?format=full/, () => withZip(2_040_746)],
+		[/attachments\/fresh-id/, () => ({ size: 2_040_746, data: b64url("zip bytes") })],
+	];
+	const link = async (handlers: Map<string, Handler>) =>
+		String(
+			result(await tool(handlers, "get_attachment")({ messageId: "m1", attachmentId: "" }))
+				.downloadUrl,
+		);
+
 	test("a wrong secret or an expired link is turned away", async () => {
 		const { handlers, doFetch, storage } = await bootAt();
-		serveGmail([[/\/messages\/m1\?format=full/, () => withZip(2_040_746)]]);
+		serveGmail(servesZip());
+		const url = await link(handlers);
+		const forged = `${url.slice(0, url.lastIndexOf("/"))}/not-the-secret`;
+		expect((await doFetch(new Request(forged))).status).toBe(404);
+		// Turning a forgery away does not spend the link it imitated.
+		expect((await doFetch(new Request(url))).status).toBe(200);
+
+		const unused = await link(handlers);
+		const key = [...storage.keys()].find((k) => k.startsWith("download:")) ?? "";
+		const offer = storage.get(key) as { at: number };
+		storage.set(key, { ...offer, at: Date.now() - 11 * 60 * 1000 });
+		expect((await doFetch(new Request(unused))).status).toBe(404);
+	});
+
+	// A link that turns up later in a message, a transcript or a log should be
+	// worth nothing by then: the fetch it was minted for has spent it.
+	test("a link serves its file once, within ten minutes", async () => {
+		const { handlers, doFetch, storage } = await bootAt();
+		serveGmail(servesZip());
 		const out = result(
 			await tool(handlers, "get_attachment")({ messageId: "m1", attachmentId: "" }),
 		);
-		const url = String(out.downloadUrl);
-		const forged = `${url.slice(0, url.lastIndexOf("/"))}/not-the-secret`;
-		expect((await doFetch(new Request(forged))).status).toBe(404);
+		const lifetime = Date.parse(String(out.expiresAt)) - Date.now();
+		expect(lifetime).toBeGreaterThan(9 * 60 * 1000);
+		expect(lifetime).toBeLessThanOrEqual(10 * 60 * 1000);
 
-		const key = [...storage.keys()].find((k) => k.startsWith("download:")) ?? "";
-		const offer = storage.get(key) as { at: number };
-		storage.set(key, { ...offer, at: Date.now() - 2 * 60 * 60 * 1000 });
+		const url = String(out.downloadUrl);
+		expect((await doFetch(new Request(url))).status).toBe(200);
 		expect((await doFetch(new Request(url))).status).toBe(404);
+		expect([...storage.keys()].filter((k) => k.startsWith("download:"))).toHaveLength(0);
+		expect(requests.filter((r) => r.url.includes("/attachments/"))).toHaveLength(1);
+	});
+
+	// Spent before Gmail is read, so a second request arriving while the first
+	// is still being served finds nothing. The cost is that a failed fetch
+	// takes a fresh link, which is one more call.
+	test("a fetch that fails still spends its link", async () => {
+		const { handlers, doFetch } = await bootAt();
+		let gmailDown = false;
+		serveGmail([
+			[
+				/\/messages\/m1\?format=full/,
+				() =>
+					gmailDown
+						? new Response(JSON.stringify({ error: { message: "backend error" } }), {
+								status: 500,
+							})
+						: withZip(2_040_746),
+			],
+			[/attachments\/fresh-id/, () => ({ size: 2_040_746, data: b64url("zip bytes") })],
+		]);
+		const url = await link(handlers);
+		gmailDown = true;
+		expect((await doFetch(new Request(url))).status).toBe(502);
+		gmailDown = false;
+		expect((await doFetch(new Request(url))).status).toBe(404);
+		expect((await doFetch(new Request(await link(handlers)))).status).toBe(200);
+	});
+
+	// The Worker checks the secret against the address before it wakes the
+	// session, so what get_attachment mints has to pass that check.
+	test("a link reaches its session through the public route", async () => {
+		const { handlers, doFetch } = await bootAt();
+		serveGmail(servesZip());
+		const url = await link(handlers);
+		const { env, woken } = fileRouteEnv(doFetch);
+		const response = await worker.fetch(new Request(url), env, {} as never);
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("zip bytes");
+		expect(woken).toEqual(["streamable-http:session-1"]);
+		expect((await worker.fetch(new Request(url), env, {} as never)).status).toBe(404);
+	});
+
+	// Only MCP traffic, which comes through the OAuth boundary, says where this
+	// deployment answers. A file address reaches the session with no grant, so
+	// whatever scheme and host it came in on must not end up in later links.
+	test("a file request does not change the host later links name", async () => {
+		const { handlers, doFetch } = await bootAt();
+		serveGmail(servesZip());
+		const name = encodeURIComponent("streamable-http:session-1");
+		expect(
+			(await doFetch(new Request(`http://elsewhere.example/download/${name}/x/y`))).status,
+		).toBe(404);
+		expect(
+			(
+				await doFetch(
+					new Request(`http://elsewhere.example/upload/${name}/x/y`, { method: "PUT", body: "x" }),
+				)
+			).status,
+		).toBe(404);
+		expect(await link(handlers)).toStartWith(`https://gmail.example.com/download/${name}/`);
 	});
 
 	test("a file one read cannot bring back gets no link", async () => {
@@ -834,6 +1445,72 @@ describe("download links", () => {
 			{} as never,
 		);
 		expect(malformed.status).toBe(404);
+	});
+});
+
+describe("the file routes", () => {
+	// Starting an object writes storage that nothing ever clears, and the
+	// limiter, counted per address and per location, does not stop a sender
+	// who rotates addresses. So an address is judged before either is reached.
+	const NAME = "streamable-http:session-1";
+	const ID = "0b6f7f0e-3f7e-4c43-9d55-2b8f8c1e6a10";
+	type Kind = "upload" | "download";
+	const address = (kind: Kind, name: string, id: string, secret: string) =>
+		`https://example.com/${kind}/${encodeURIComponent(name)}/${id}/${secret}`;
+	const send = (env: never, kind: Kind, url: string) =>
+		worker.fetch(
+			kind === "upload" ? new Request(url, { method: "PUT", body: "x" }) : new Request(url),
+			env,
+			{} as never,
+		);
+
+	test("an address no session minted wakes nothing", async () => {
+		const { env, woken, limited } = fileRouteEnv();
+		for (const kind of ["upload", "download"] as const) {
+			const response = await send(env, kind, address(kind, "attacker-1", ID, "0".repeat(64)));
+			expect(response.status).toBe(404);
+			expect(await response.text()).toContain("answers to this address");
+		}
+		expect(woken).toEqual([]);
+		expect(limited).toEqual([]);
+	});
+
+	test("a malformed escape is a wrong address, not a crash", async () => {
+		const { env, woken } = fileRouteEnv();
+		for (const kind of ["upload", "download"] as const) {
+			for (const path of [`%E0%A4%A/${ID}/s`, `n/%zz/s`, `n/${ID}/%`]) {
+				const response = await send(env, kind, `https://example.com/${kind}/${path}`);
+				expect(response.status).toBe(404);
+			}
+		}
+		expect(woken).toEqual([]);
+	});
+
+	test("a secret opens only the address it was minted for", async () => {
+		const { env, woken, limited } = fileRouteEnv();
+		const secret = await signData(`download:${NAME}/${ID}`, COOKIE_KEY);
+		const elsewhere: [Kind, string][] = [
+			["upload", address("upload", NAME, ID, secret)],
+			["download", address("download", "streamable-http:session-2", ID, secret)],
+			["download", address("download", NAME, crypto.randomUUID(), secret)],
+			[
+				"download",
+				address("download", NAME, ID, await signData(`download:${NAME}/${ID}`, "another-key")),
+			],
+		];
+		for (const [kind, url] of elsewhere) {
+			expect((await send(env, kind, url)).status).toBe(404);
+		}
+		expect(woken).toEqual([]);
+		expect(limited).toEqual([]);
+
+		const genuine = await send(env, "download", address("download", NAME, ID, secret));
+		expect(genuine.status).toBe(200);
+		expect(await genuine.text()).toBe("reached");
+		expect(woken).toEqual([NAME]);
+		// What passes is still counted: holding a real link is no licence to
+		// fetch it without end.
+		expect(limited).toHaveLength(1);
 	});
 });
 
@@ -956,6 +1633,8 @@ describe("get_thread on a thread too large to read at once", () => {
 		await tool(handlers, "get_thread")({ threadId: "t1", includeBodies: false });
 		const threadCall = requests.find((r) => r.url.includes("/threads/"));
 		expect(threadCall?.url).toContain("metadataHeaders=Subject");
+		expect(threadCall?.url).toContain("metadataHeaders=Reply-To");
+		expect(threadCall?.url).toContain("metadataHeaders=Bcc");
 	});
 });
 
@@ -1285,6 +1964,85 @@ describe("the public OAuth endpoints", () => {
 		expect(asked).toEqual(["203.0.113.9", "203.0.113.9"]);
 	});
 
+	// A /64 belongs to one subscriber, so walking its addresses must not buy a
+	// fresh allowance each time.
+	test("counts every address in an IPv6 /64 as one registering caller", async () => {
+		const asked: string[] = [];
+		const env = {
+			REGISTER_LIMITER: {
+				limit: async ({ key }: { key: string }) => {
+					asked.push(key);
+					return { success: asked.length <= 1 };
+				},
+			},
+		};
+		const register = (address: string) =>
+			worker.fetch(
+				new Request("https://example.com/register", {
+					method: "POST",
+					headers: { "Content-Type": "application/json", "CF-Connecting-IP": address },
+					body: "{}",
+				}),
+				env as never,
+				{} as never,
+			);
+		expect((await register("2001:db8:1:2::a")).status).not.toBe(429);
+		expect((await register("2001:db8:1:2:ffff::b")).status).toBe(429);
+		expect(asked).toEqual(["2001:db8:1:2::/64", "2001:db8:1:2::/64"]);
+	});
+
+	// Each sign-in step stores or spends a state, so each is metered before
+	// anything is read or stored. Hono decodes a path before routing it, and a
+	// percent-encoded spelling reaches the same handler, so it meets the same
+	// limit.
+	test("meters every sign-in step before KV, however its path is spelled", async () => {
+		const asked: string[] = [];
+		const touched: string[] = [];
+		const kv = {
+			get: async (key: string) => {
+				touched.push(`get ${key}`);
+				return null;
+			},
+			put: async (key: string) => {
+				touched.push(`put ${key}`);
+			},
+			delete: async (key: string) => {
+				touched.push(`delete ${key}`);
+			},
+		};
+		const env = {
+			OAUTH_KV: kv,
+			REGISTER_LIMITER: {
+				limit: async ({ key }: { key: string }) => {
+					asked.push(key);
+					return { success: false };
+				},
+			},
+		};
+		const steps = [
+			["GET", "/authorize"],
+			["HEAD", "/authorize"],
+			["POST", "/authorize"],
+			["GET", "/callback"],
+			["GET", "/%61uthorize"],
+			["POST", "/%61uthorize"],
+			["GET", "/%63allback"],
+		] as const;
+		for (const [method, path] of steps) {
+			const response = await worker.fetch(
+				new Request(`https://example.com${path}?client_id=c&state=s&code=x`, {
+					method,
+					headers: { "CF-Connecting-IP": "203.0.113.9" },
+				}),
+				env as never,
+				{} as never,
+			);
+			expect(`${method} ${path} ${response.status}`).toBe(`${method} ${path} 429`);
+		}
+		expect(asked).toEqual(steps.map(() => "203.0.113.9"));
+		expect(touched).toEqual([]);
+	});
+
 	// The MCP endpoint has a ceiling of its own, and a streamed message slips
 	// past it the same way. This one needs a grant, so it is reached only by
 	// someone already allowed to connect.
@@ -1304,6 +2062,116 @@ describe("the public OAuth endpoints", () => {
 			expect(offered()).toBeLessThan(8);
 		});
 	}
+});
+
+describe("who may register and sign in", () => {
+	const CLAUDE = "https://claude.ai/api/mcp/auth_callback";
+
+	// The provider stores clients as JSON and reads them back parsed.
+	function memoryKv() {
+		const store = new Map<string, string>();
+		return {
+			store,
+			get: async (key: string, options?: { type?: string }) => {
+				const value = store.get(key) ?? null;
+				return value !== null && options?.type === "json" ? JSON.parse(value) : value;
+			},
+			put: async (key: string, value: string) => {
+				store.set(key, value);
+			},
+			delete: async (key: string) => {
+				store.delete(key);
+			},
+		};
+	}
+
+	const clients = (kv: ReturnType<typeof memoryKv>) =>
+		[...kv.store.keys()].filter((key) => key.startsWith("client:"));
+
+	const register = (kv: ReturnType<typeof memoryKv>, redirectUris: string[]) =>
+		worker.fetch(
+			new Request("https://example.com/register", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					client_name: "Claude",
+					redirect_uris: redirectUris,
+					token_endpoint_auth_method: "none",
+				}),
+			}),
+			{ OAUTH_KV: kv } as never,
+			{} as never,
+		);
+
+	// Each of these used to register, and stayed in KV for the decade a
+	// registration lasts.
+	test.each([
+		["another host", ["https://evil.example/cb"]],
+		["an app scheme", ["microsoft-edge:https://claude.ai/api/mcp/auth_callback"]],
+		["a loopback callback", ["http://localhost:33418/callback"]],
+	])("refuses to register a client whose only redirect is %s", async (_name, uris) => {
+		const kv = memoryKv();
+		const response = await register(kv, uris);
+		expect(response.status).toBe(400);
+		expect(((await response.json()) as { error?: string }).error).toBe("invalid_client_metadata");
+		expect(clients(kv)).toEqual([]);
+	});
+
+	test.each([
+		["claude.ai", [CLAUDE]],
+		["claude.com", ["https://claude.com/api/mcp/auth_callback"]],
+		["Claude beside another redirect", [CLAUDE, "https://evil.example/cb"]],
+	])("registers a client that names %s", async (_name, uris) => {
+		const kv = memoryKv();
+		const response = await register(kv, uris);
+		expect(response.status).toBe(201);
+		expect(clients(kv)).toHaveLength(1);
+	});
+
+	// The provider hands the registration check no env, so the Worker reads the
+	// setting from the runtime's module-level copy, which is what this sets.
+	test("registers by ALLOWED_REDIRECT_URIS when it is set", async () => {
+		const { env: runtimeEnv } = (await import("cloudflare:workers")) as unknown as {
+			env: Record<string, string | undefined>;
+		};
+		runtimeEnv.ALLOWED_REDIRECT_URIS = "https://app.example/oauth/callback";
+		try {
+			const kv = memoryKv();
+			expect((await register(kv, ["https://app.example/oauth/callback"])).status).toBe(201);
+			expect((await register(kv, [CLAUDE])).status).toBe(400);
+			expect(clients(kv)).toHaveLength(1);
+		} finally {
+			delete runtimeEnv.ALLOWED_REDIRECT_URIS;
+		}
+	});
+
+	// Registering beside Claude's callback must not make the other redirect usable.
+	test("refuses, at /authorize, a registered redirect that is not Claude's", async () => {
+		const kv = memoryKv();
+		const registered = await register(kv, [CLAUDE, "https://evil.example/cb"]);
+		const { client_id } = (await registered.json()) as { client_id: string };
+		const authorize = (redirectUri: string) =>
+			worker.fetch(
+				new Request(
+					`https://example.com/authorize?${new URLSearchParams({
+						response_type: "code",
+						client_id,
+						redirect_uri: redirectUri,
+						code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+						code_challenge_method: "S256",
+						state: "s",
+					})}`,
+				),
+				{ OAUTH_KV: kv } as never,
+				{} as never,
+			);
+		const elsewhere = await authorize("https://evil.example/cb");
+		expect(elsewhere.status).toBe(400);
+		expect(await elsewhere.text()).toBe("This server only signs in Claude.");
+		const claude = await authorize(CLAUDE);
+		expect(claude.status).toBe(200);
+		expect(await claude.text()).toContain("is requesting access");
+	});
 });
 
 describe("the headers the boundary hands on", () => {
@@ -1358,9 +2226,16 @@ describe("when the account's identities cannot be read", () => {
 			[/\/messages\/m1\?format=full/, () => message("m1")],
 			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
 		]);
-		await expect(tool(handlers, "reply_all")({ messageId: "m1", body: "ok" })).rejects.toThrow(
-			/send-as identities/,
-		);
+		await expect(
+			tool(
+				handlers,
+				"reply_all",
+			)({
+				messageId: "m1",
+				recipients: ["alice@example.com", "bob@example.com", "carol@example.com"],
+				body: "ok",
+			}),
+		).rejects.toThrow(/send-as identities/);
 		expect(requests.filter((r) => r.url.includes("/messages/send"))).toHaveLength(0);
 	});
 
@@ -1381,7 +2256,16 @@ describe("when the account's identities cannot be read", () => {
 			[/\/messages\/m1\?format=full/, () => message("m1")],
 			[/\/messages\/send/, () => ({ id: "sent", threadId: "t-m1" })],
 		]);
-		const out = result(await tool(handlers, "reply_all")({ messageId: "m1", body: "ok" }));
+		const out = result(
+			await tool(
+				handlers,
+				"reply_all",
+			)({
+				messageId: "m1",
+				recipients: ["alice@example.com", "bob@example.com", "carol@example.com"],
+				body: "ok",
+			}),
+		);
 		expect(out.to).toEqual(["alice@example.com"]);
 	});
 });
@@ -1425,5 +2309,85 @@ describe("forwarding a long message", () => {
 		);
 		expect(carried).toContain("Paragraph 299:");
 		expect(carried).not.toContain("truncated:");
+	});
+});
+
+describe("tool annotations", () => {
+	const sends = ["send_message", "reply_all", "forward_message", "send_draft"];
+	const destroys = [
+		"trash_message",
+		"trash_thread",
+		"delete_draft",
+		"delete_label",
+		"update_draft",
+		"modify_labels",
+		"modify_thread_labels",
+		"batch_modify_messages",
+	];
+
+	// A client decides from these which calls run without asking. A tool that
+	// declares none counts as a destructive write, so reads and sends share one
+	// permission, and allowing the searches allows the sends with them.
+	test("every tool declares them", async () => {
+		const { handlers, annotations } = await boot();
+		expect(handlers.size).toBe(27);
+		const bare = [...handlers.keys()].filter(
+			(name) => typeof annotations.get(name)?.readOnlyHint !== "boolean",
+		);
+		expect(bare).toEqual([]);
+	});
+
+	test("nothing that sends or destroys claims to only read", async () => {
+		const { annotations } = await boot();
+		for (const name of [...sends, ...destroys]) {
+			expect(annotations.get(name)).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+		}
+		for (const name of sends) {
+			expect(annotations.get(name)?.openWorldHint).toBe(true);
+		}
+		const reads = [...annotations]
+			.filter(([, hints]) => hints?.readOnlyHint === true)
+			.map(([name]) => name)
+			.sort();
+		expect(reads).toEqual([
+			"get_attachment",
+			"get_message",
+			"get_thread",
+			"list_drafts",
+			"list_labels",
+			"search_messages",
+			"whoami",
+		]);
+	});
+
+	// The stub sees only what was passed. The SDK decides what a client is
+	// told, and an annotations object it took for a schema would never get
+	// there, so the listing is read the way a client reads it.
+	test("reach a client in the tool listing", async () => {
+		const made = makeAgent();
+		const server = new McpServer({ name: "test", version: "0" });
+		made.agent.server = server;
+		await (made.agent as { init: () => Promise<void> }).init();
+		const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+		await server.connect(serverSide);
+		const client = new Client({ name: "test", version: "0" });
+		await client.connect(clientSide);
+		try {
+			const { tools } = await client.listTools();
+			expect(tools).toHaveLength(27);
+			expect(tools.filter((t) => t.annotations === undefined).map((t) => t.name)).toEqual([]);
+			const listed = (name: string) => tools.find((t) => t.name === name);
+			expect(listed("send_draft")?.annotations).toEqual({
+				readOnlyHint: false,
+				destructiveHint: true,
+				openWorldHint: true,
+			});
+			expect(listed("whoami")?.annotations).toEqual({ readOnlyHint: true, openWorldHint: false });
+			// The approval card shows what was passed, so the list has to be.
+			expect(listed("reply_all")?.inputSchema.required).toContain("recipients");
+			expect(listed("send_draft")?.inputSchema.required).toContain("recipients");
+		} finally {
+			await client.close();
+		}
 	});
 });

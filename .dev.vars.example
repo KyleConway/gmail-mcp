@@ -4,3 +4,11 @@ GOOGLE_CLIENT_SECRET=
 COOKIE_ENCRYPTION_KEY=
 # comma-separated Google account emails permitted to authenticate
 ALLOWED_EMAILS=
+# comma-separated OAuth client ids permitted to sign in (wrangler secret put
+# ALLOWED_CLIENT_IDS); empty leaves pinning to PIN_FIRST_CLIENT, which pins each
+# account to the first client that completes a sign-in for it
+ALLOWED_CLIENT_IDS=
+# optional: exact redirect URIs a client may sign in with, comma-separated;
+# unset means Claude's two callbacks only. Every entry is one more place an
+# authorization code can go, and localhost entries widen that the most
+# ALLOWED_REDIRECT_URIS=

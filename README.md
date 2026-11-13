@@ -1,327 +1,142 @@
-<div align="center">
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./docs/logo-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="./docs/logo-light.svg">
-  <img src="./docs/logo-light.svg" alt="gmail-mcp" width="520">
-</picture>
-
-**Gmail for your AI assistant — several accounts at once, on a server you own.**
-
-[![MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
-[![Cloudflare Workers](https://img.shields.io/badge/runs%20on-Cloudflare%20Workers-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/workers/)
-[![MCP](https://img.shields.io/badge/protocol-MCP-6E56CF)](https://modelcontextprotocol.io/)
-[![OAuth 2.1](https://img.shields.io/badge/auth-OAuth_2.1_+_PKCE-2ea44f)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1)
-[![27 tools](https://img.shields.io/badge/tools-27-0b7285)](#what-it-can-do)
-[![tests](https://img.shields.io/badge/tests-260_passing-success?logo=bun&logoColor=white)](#how-it-was-tested)
-
-*[日本語版](./README.ja.md) · [简体中文](./README.zh.md)*
-
-</div>
-
 <p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./docs/demo-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="./docs/demo-light.svg">
-  <img src="./docs/demo-light.svg" alt="An assistant searches a work and a personal mailbox, then replies to a thread with an attachment" width="760">
-</picture>
+  <img src="./docs/cards/header.svg" alt="gmail-mcp for Claude. Two Gmail accounts. One Claude." width="800">
 </p>
 
-**gmail-mcp** connects Gmail to Claude and any other [MCP](https://modelcontextprotocol.io/) client. It can **search and read** mail, **send and reply-all** with quoted history, **forward**, handle **attachments and inline images**, and manage drafts, labels, and threads — across **several Google accounts at the same time**.
+# Gmail for Claude, times two
 
-It runs as a remote server on **your own Cloudflare Worker**, so the same connection answers from Claude Code on a laptop, claude.ai in a browser, and Claude on a phone. Each connection signs in to **one** Google account, and the Google refresh token stays in **your** Cloudflare account.
+Claude's built-in Gmail connector holds one Google account. That drove me nuts. I have a work inbox and a personal inbox like most people. Every time I wanted Claude to look at the other one I had to go into settings, disconnect Google and connect it again. An hour later I'd do it all again in reverse.
 
-Two things push people here. The Gmail connectors built into Claude and Google read mail and write drafts, but **cannot send**, and hold one Google account per assistant account. Servers that can send are usually local processes — fine at a desk, invisible from a phone.
+I got tired of that and fixed it.
 
----
+This is a small server you run on your own Cloudflare account. You add it to Claude as a custom connector for your second inbox and leave the built-in connector on your first. Now both stay connected. Ask Claude to "check my work inbox", "draft a reply from personal", or "search both for the invoice" and it does.
 
-## How it compares
+It works anywhere your Claude connectors do. That's claude.ai in the browser, the desktop app, your phone and Claude Code.
+
+## Why you'd want this instead of something else
+
+You've got options and some of them are fine. Zapier and similar services route your mail through their servers and bill you per call. Local MCP servers work great at your desk and disappear the moment you pick up your phone.
+
+This one is yours. It runs in your Cloudflare account. Your Google tokens live there, encrypted. Nobody else's server sits between you and your mail, including mine. I never see any of it.
+
+## How it goes
 
 <p align="center">
-<img src="./docs/comparison-en.svg" alt="gmail-mcp compared with built-in connectors, google_workspace_mcp, and Gmail-MCP-Server" width="880">
+  <img src="./docs/cards/steps.svg" alt="1. Deploy the Worker. 2. Set up Google. 3. Connect Claude. About 20 minutes." width="800">
 </p>
 
-<details>
-<summary><b>A longer comparison</b> — six projects, twelve rows</summary>
+You need a Cloudflare account (the free one works), [bun](https://bun.sh), git and about 20 minutes. Most of those minutes are spent clicking through Google Cloud, which has a few screens that will block you until they're filled in a specific way. I ran into every one of them so the [setup guide](./docs/SETUP.md) walks you around each.
 
-<br>
-
-| | **gmail-mcp** | [Claude](https://claude.com/connectors/gmail) · [Google](https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server) built-in | [taylorwilsdon/<br>google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) | [ArtyMcLabin/<br>Gmail-MCP-Server](https://github.com/ArtyMcLabin/Gmail-MCP-Server) | [shinzo-labs/<br>gmail-mcp](https://github.com/shinzo-labs/gmail-mcp) | [aaronsb/<br>google-workspace-mcp](https://github.com/aaronsb/google-workspace-mcp) |
-| :-- | :-: | :-: | :-: | :-: | :-: | :-: |
-| Where it runs | Cloudflare Workers | vendor-hosted | your server or local | local | local | local |
-| Reachable from a phone | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Several mailboxes at once | ✅ bound per connection | ❌ | ✅ chosen per call | ❌ aliases only | ❌ | ✅ chosen per call |
-| Send mail | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| Attachments · inline `cid:` images | ✅ | undocumented | ✅ | ✅ | ❌ | ✅ |
-| Reply-all with quoted history | ✅ | ❌ | drafts only | no quoting | ❌ | ✅ |
-| Forward | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ |
-| Honors each part's charset | ✅ | — | ❌ UTF-8 assumed | ❌ UTF-8 assumed | ❌ | ❌ |
-| Rejects CRLF header injection | ✅ | — | ✅ framework | ✅ strips | ❌ **none** | ✅ |
-| Mailbox settings (filters, vacation) | ❌ out of scope | ❌ | filters | filters | ✅ | ❌ |
-| Tool count | 24 | 11–16 | 14 (Gmail) | 30 | 64 | 11 |
-| Who holds your refresh token | you | vendor | you | you | you | you |
-
-[`google_workspace_mcp`](https://github.com/taylorwilsdon/google_workspace_mcp) is the most complete project here. It covers all of Workspace rather than Gmail alone, and it appends your Gmail signature and pulls attachments straight from a URL, neither of which gmail-mcp does. [`shinzo-labs/gmail-mcp`](https://github.com/shinzo-labs/gmail-mcp) reaches vacation responders, delegates, and S/MIME through its 64 tools; those live under `gmail.settings.*`, a scope gmail-mcp never requests, so they stay beyond its reach whatever happens to a grant.
-
-Two design differences decide most of the rest. Routing accounts by a call argument lets one grant touch every connected mailbox, while binding the mailbox to the connection means a wrong argument reaches nothing. And on reading, the local servers decode every part as UTF-8: ISO-2022-JP and Shift_JIS mail arrives garbled, and long messages that Gmail stores as attachment blobs come back with an empty body.
-
-</details>
-
----
-
-## Deploy it
-
-About ten minutes. You need a Cloudflare account, [bun](https://bun.sh), and a Google account. A domain on the Cloudflare account is optional — without one the Worker answers on `workers.dev`.
-
-### 1 · Create a Google OAuth client
+The short version:
 
 ```sh
-PROJECT="gmail-mcp-$(openssl rand -hex 3)"
-gcloud auth login
-gcloud projects create "$PROJECT" --name="gmail-mcp"
-gcloud config set project "$PROJECT"
-gcloud services enable gmail.googleapis.com
-```
-
-Google exposes no API for the next two steps, so they happen in the [Cloud console](https://console.cloud.google.com/):
-
-- [**OAuth consent screen**](https://console.cloud.google.com/auth/overview) → *External*, then under **Audience** press **Publish app**. Left in Testing, Google expires every refresh token after 7 days and each connection dies with its token. Published, the app shows an unverified-app warning at sign-in and serves up to 100 accounts.
-- [**Credentials**](https://console.cloud.google.com/apis/credentials) **→ Create credentials → OAuth client ID** → *Web application*, with `https://<your-host>/callback` as an authorized redirect URI. Keep the client ID and secret.
-
-`<your-host>` is the domain you point at the Worker, or the `workers.dev` hostname it gets otherwise. Deploying first and coming back to fill this in works — the guide the Worker serves at `/` shows the exact value.
-
-### 2 · Deploy the Worker
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mkpoli/gmail-mcp)
-
-The button copies the repository into your GitHub account, creates the KV namespace and the Durable Object, and asks for the four secrets. It deploys to `workers.dev`; a custom domain is attached afterwards under **Settings → Domains & Routes**.
-
-From a terminal instead:
-
-```sh
-git clone https://github.com/mkpoli/gmail-mcp && cd gmail-mcp
+git clone https://github.com/KyleConway/gmail-mcp && cd gmail-mcp
 bun install
-bun run setup
+./node_modules/.bin/wrangler login
+bun run deploy          # prints https://gmail-mcp.<your-subdomain>.workers.dev
 ```
 
-`bun run setup` asks which domain to answer on, creates or reuses the `OAUTH_KV` namespace, takes the client ID and secret, generates a cookie key, and deploys. Those first two answers land in `wrangler.local.jsonc`, which git ignores — `wrangler.jsonc` names no account's namespace and no one's domain, so a clone deploys anywhere. Re-running setup to rotate a single secret is safe.
+1. **Set up Google.** Create an External OAuth app, fill in its Branding page, publish it and make a **Web application** client with the redirect URI `https://<your-worker-host>/callback`.
+2. **Hand the Worker its secrets.** Type the client secret yourself. Don't paste it into a chat with any AI, mine included.
+   ```sh
+   ./node_modules/.bin/wrangler secret put GOOGLE_CLIENT_ID
+   ./node_modules/.bin/wrangler secret put GOOGLE_CLIENT_SECRET
+   openssl rand -hex 32 | ./node_modules/.bin/wrangler secret put COOKIE_ENCRYPTION_KEY
+   ./node_modules/.bin/wrangler secret put ALLOWED_EMAILS     # the Gmail address you're connecting
+   ```
+3. **Connect Claude.** In claude.ai, go to **Settings → Connectors → Add custom connector**, call it something like "Gmail – Personal" and use `https://<your-worker-host>/mcp/personal`. Leave the OAuth fields empty and hit **Connect**.
+4. **Approve and sign in.** Approve the Worker's dialog and pick your Google account. Google will warn you the app isn't verified. That's expected because it's your app and you're its only user. Click **Advanced → Go to …**.
+5. **Say hi.** Ask Claude to run `whoami`. It should tell you your address.
 
-### 3 · Connect a client
+## Teaching Claude which inbox is which
 
-Leave the client ID and secret fields empty — MCP clients register themselves.
+Once both inboxes are connected, Claude needs to know which one is "work" and which one is "personal". Paste something like this into your personal preferences in Claude's settings (or into `~/.claude/CLAUDE.md` for Claude Code), with your own addresses:
 
-```sh
-claude mcp add --transport http gmail-personal https://<your-host>/mcp
-claude mcp add --transport http gmail-work     https://<your-host>/mcp/work
+```text
+I have two Google accounts connected to Claude:
+- Work: work@company.example. The built-in Gmail, Google Calendar and Google Drive connectors.
+- Personal: me@gmail.example. The custom connector "Gmail – Personal" (Gmail only).
+
+Rules:
+- Use the account I name. For "both" or "all my email", search both and label each result with its account.
+- If it isn't clear which account I mean, ask. Never send, reply or draft from an account I didn't name.
+- An empty result means that one mailbox had nothing. Say which mailbox it was.
 ```
 
-Run `/mcp` in Claude Code to sign each connection in to its Google account. In claude.ai it is **Settings → Connectors → Add custom connector** with the same URL. Any single-segment label works after `/mcp/`, which is how one deployment serves several mailboxes to clients that reject two servers sharing a URL.
+Don't skip the last rule. Without it Claude can search the wrong inbox, find nothing and tell you the email doesn't exist.
 
-Your deployment serves this guide at `https://<your-host>/`.
+Got a third account? Add another connector with a different label, like `/mcp/family`, put that address in `ALLOWED_EMAILS` and bump `MAX_ACCOUNTS` in `wrangler.jsonc`.
 
----
+## What Claude gets to do on its own
+
+Every tool tells Claude whether it reads, writes or sends so you can let the harmless stuff run and make the rest ask first. In claude.ai, open the connector under **Settings → Connectors** and set:
+
+| Setting | Tools |
+| :-- | :-- |
+| **Always allow** | `whoami`, `search_messages`, `get_message`, `get_thread`, `get_attachment`, `list_labels`, `list_drafts`, `create_draft`, `stage_attachment_begin`, `stage_attachment_append`, `stage_attachment_finish` |
+| **Needs approval** | `update_draft`, `send_message`, `reply_all`, `forward_message`, `send_draft`, `delete_draft`, `trash_message`, `trash_thread`, `untrash_message`, `untrash_thread`, `modify_labels`, `modify_thread_labels`, `batch_modify_messages`, `create_label`, `update_label`, `delete_label` |
+
+I let reading and drafting run on their own and make sending ask. A draft never leaves your mailbox until you send it. And if you never forward mail with Claude, block `forward_message` outright, because forwarding is the easiest way for an email with hidden instructions to get your mail sent somewhere else.
+
+When Claude does send, `reply_all` and `send_draft` have to list every recipient so the approval prompt shows you who's getting the mail, including any Reply-To or Bcc.
 
 ## What it can do
 
-<table>
-<tr><th align="left">📖 Read</th><th align="left">✍️ Write</th><th align="left">🏷 Organize</th></tr>
-<tr valign="top">
-<td>
+27 tools covering the whole mailbox:
 
-`whoami`<br>
-`search_messages`<br>
-`get_message`<br>
-`get_thread`<br>
-`get_attachment`
+- **Read:** `whoami`, `search_messages`, `get_message`, `get_thread`, `get_attachment`
+- **Write:** `send_message`, `reply_all`, `forward_message`, `create_draft`, `update_draft`, `send_draft`, `delete_draft`, `list_drafts`, `stage_attachment_begin`, `stage_attachment_append`, `stage_attachment_finish`
+- **Organize:** `list_labels`, `create_label`, `update_label`, `delete_label`, `modify_labels`, `modify_thread_labels`, `batch_modify_messages`, `trash_message`, `untrash_message`, `trash_thread`, `untrash_thread`
 
-</td>
-<td>
+Outgoing mail looks like it came from a regular mail client, with plain text, an HTML version, attachments and inline images. Emoji and non-Latin names come through intact. Long threads come back trimmed so they don't eat Claude's whole context.
 
-`send_message`<br>
-`reply_all`<br>
-`forward_message`<br>
-`create_draft`<br>
-`update_draft`<br>
-`send_draft`<br>
-`delete_draft`<br>
-`list_drafts`<br>
-`stage_attachment_begin`<br>
-`stage_attachment_append`<br>
-`stage_attachment_finish`
+It can't permanently delete anything. Trash is as far as it goes and Gmail keeps trash for 30 days.
 
-</td>
-<td>
+## Stuff you should know
 
-`list_labels`<br>
-`create_label`<br>
-`update_label`<br>
-`delete_label`<br>
-`modify_labels`<br>
-`modify_thread_labels`<br>
-`batch_modify_messages`<br>
-`trash_message` · `untrash_message`<br>
-`trash_thread` · `untrash_thread`
+- **The free Cloudflare plan has a daily write cap.** Someone who finds your Worker's URL could burn through it and knock your connector offline until midnight UTC. They can't read anything. It's an annoyance. Workers Paid ($5/month) removes the cap.
+- **It only talks to Claude, out of the box.** `claude mcp add`, the MCP Inspector and anything signing in through localhost get turned away. Claude Code still works, because it picks up your claude.ai connectors. If you really want another client, list its exact callback in `ALLOWED_REDIRECT_URIS` and keep in mind that each one you add is another way in.
+- **First connection wins.** The first Claude connection to sign in to an account is the only one that ever can. So connect your own right after you deploy and never approve a sign-in you didn't start from Claude's **Connect** button. If you remove and re-add the connector later, the error page tells you how to reset it.
+- **Google calls it unverified.** That's fine for your own personal app. Google allows unverified apps up to 100 users and you need one.
 
-</td>
-</tr>
-</table>
+## Pulling the plug
 
-Messages leave the way a mail client sends them: plain text with an HTML alternative, file attachments, and inline images referenced by `cid:`, nested as `multipart/mixed › multipart/related › multipart/alternative`. Subjects and display names use RFC 2047, filenames use RFC 2231, so Japanese, Chinese, and emoji survive the trip.
+Want to cut it off? Remove the app at [myaccount.google.com/connections](https://myaccount.google.com/connections), or delete the OAuth client in Google Cloud. Either one kills the tokens on the spot.
 
-`reply_all` reads the original's `Reply-To`, `From`, `To`, and `Cc`, drops your own address and any address you send mail as, answers from the one the sender wrote to, carries the `References` chain, and quotes the original in whichever parts you send. `forward_message` reproduces the forwarded envelope and can re-attach the original's files; when they cannot all go, nothing is sent.
+Don't count on rotating the client secret. Old tokens keep working after a rotation.
 
-`create_draft` with `replyToMessageId` writes the reply as a draft to edit before sending: it joins the original's thread, carries `In-Reply-To` and `References`, derives the reply-all recipients and the `Re:` subject, and quotes the original. `update_draft` changes only the fields it is given; recipients, text, files added by hand in any client, and the thread the draft answers are read back and kept. A file whose base64 will not fit through tool arguments is staged instead: `stage_attachment_begin` returns an upload URL that takes the raw bytes in one `curl -T`, `stage_attachment_append` takes base64 in chunks, and every `attachments` field accepts the resulting `stagingId`.
+## Configuration
 
-Reading is bounded on purpose: message and thread bodies have character budgets, a whole response has a byte ceiling, and an attachment is returned inline only while it stays small enough to read. A long mailing-list thread comes back trimmed with a note saying so rather than filling the assistant's context. A larger file comes back as a download link that works for an hour while the session stays open, and `curl -o` saves it to disk without its bytes passing through the conversation.
-
----
-
-## How it works
-
-Two OAuth flows meet in one Worker. The MCP client authenticates *to* the Worker; the Worker authenticates *to* Google on your behalf. Neither side holds the other's credentials.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as MCP client<br/>(Claude Code · claude.ai)
-    participant W as Worker<br/>(OAuthProvider + McpAgent)
-    participant G as Google<br/>(OAuth + Gmail API)
-
-    C->>W: POST /register (dynamic client registration)
-    C->>W: GET /authorize (PKCE challenge)
-    W->>C: approval dialog
-    C->>G: consent screen — pick the account
-    G->>W: GET /callback?code=…
-    W->>W: allowlist check on the verified email
-    W->>G: exchange code → access + refresh token
-    W->>C: MCP access token (Google tokens sealed inside the grant)
-    C->>W: POST /mcp — tools/call
-    W->>G: Gmail REST (token refreshed as needed)
-    G->>W: message / thread / label data
-    W->>C: tool result
-```
-
-<p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./docs/architecture-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="./docs/architecture-light.svg">
-  <img src="./docs/architecture-light.svg" alt="An MCP client connects to your Cloudflare Worker, which calls the Gmail API" width="720">
-</picture>
-</p>
-
-| Layer | File | What it does |
+| Name | Kind | What it does |
 | :-- | :-- | :-- |
-| 🔐 MCP-side OAuth | [`workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) | Dynamic client registration, PKCE, grants in KV with the Google tokens sealed inside |
-| 🔗 Google-side OAuth | `src/google-handler.ts` | Authorization code with offline access, one-time state bound to the browser session, double-submit CSRF, allowlist on the verified email |
-| 🤖 Agent | `src/index.ts` | One Durable Object per MCP session, bound to the account that opened it; single-flight token refresh, throttled fan-out |
-| ✉️ Mail | `src/gmail.ts` | RFC 822 construction, MIME tree walking, charset decoding, reply and forward composition |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | secret | Your Google OAuth Web application client |
+| `COOKIE_ENCRYPTION_KEY` | secret | `openssl rand -hex 32`. Signs approval forms, cookies and attachment links |
+| `ALLOWED_EMAILS` | secret | Who may sign in: addresses, `*@domain`, or `*`. Empty means nobody |
+| `ALLOWED_CLIENT_IDS` | secret, optional | Exact OAuth client ids allowed to sign in. Overrides the automatic first-connection lock |
+| `MAX_ACCOUNTS` | var | How many Google accounts may ever sign in. Default `1` |
+| `PIN_FIRST_CLIENT` | var | Lock each account to its first connection. Default `"true"` |
+| `ALLOWED_REDIRECT_URIS` | var, optional | Exact callback URIs that replace Claude's two. Unset means Claude only |
 
-### Built with
+If you used `bun run setup` to put it on your own domain, it writes a `wrangler.local.jsonc` that wrangler reads instead of `wrangler.jsonc`. `bun run deploy` and `bun run dev` rebuild that file first so stick to those rather than calling `wrangler deploy` directly.
 
-- **[TypeScript](https://www.typescriptlang.org/) on [Cloudflare Workers](https://developers.cloudflare.com/workers/)** — Durable Objects hold one MCP session each, KV holds the OAuth grants
-- **[Hono](https://hono.dev/)** — routing for the OAuth endpoints, the Google callback, and the setup page at `/`
-- **[`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider)** — the OAuth 2.1 server that MCP clients register against
-- **[`agents`](https://github.com/cloudflare/agents)** — `McpAgent`, the MCP transport over Durable Objects
-- **[`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk)** with **[Zod](https://zod.dev/)** — tool definitions and argument validation
-- **[Bun](https://bun.sh/)**, **[Biome](https://biomejs.dev/)**, **[Wrangler](https://developers.cloudflare.com/workers/wrangler/)** — install, test, lint, deploy
-
-Gmail itself is called over plain `fetch` against the [REST API](https://developers.google.com/workspace/gmail/api/reference/rest). The official `googleapis` SDK assumes Node and carries far more than a Worker should ship, so message building, MIME parsing, and token refresh live in `src/gmail.ts` and `src/utils.ts` instead.
-
-### Endpoints
-
-| Path | Purpose |
-| :-- | :-- |
-| `/mcp` | MCP endpoint |
-| `/mcp/<label>` | The same server under any single-segment label, for clients that reject two servers sharing a URL |
-| `/` | This setup guide |
-| `/authorize` · `/token` · `/register` · `/callback` | OAuth machinery |
-
----
-
-## Who can sign in
-
-`ALLOWED_EMAILS` decides, checked against the address Google reports as verified — after consent, before any grant exists.
-
-| Value | Who gets in |
-| :-- | :-- |
-| *(empty)* | nobody |
-| `you@gmail.com, work@company.com` | those accounts |
-| `*@company.com` | anyone in that domain |
-| `*` | any verified Google account |
-
-Each grant reaches only the mailbox that authenticated it, so widening this list never widens access to mailboxes already connected. Setting `*` lets strangers use your deployment, and your Google client's quota, for their own mail.
-
----
-
-## Limits
-
-Two ceilings keep a shared deployment from being drained, both set in `wrangler.jsonc`:
-
-| Setting | Where | Default | What it bounds |
-| :-- | :-- | :-- | :-- |
-| `MAX_ACCOUNTS` | `vars` | `25` | Roughly how many distinct Google accounts may ever complete sign-in. Accounts already connected keep working when the cap is reached; new ones are turned away. Sign-ins arriving together each read the count before any of them is recorded, so the total can settle a little above this number. Google caps unverified apps at 100 users, so leave room below that. |
-| `RATE_LIMITER.simple.limit` | `unsafe.bindings` | `120` per `60`s | Gmail calls one account may make in that window, across all of its sessions. Cloudflare keeps this count per location, so an account connecting from two regions gets roughly that many in each. A wide read spends several: `search_messages` returning 50 makes 51 calls. |
-| `REGISTER_LIMITER.simple.limit` | `unsafe.bindings` | `10` per `60`s | Client registrations one address may make in that window. A client registers once and keeps the id it is given, so ordinary use never approaches this; the ceiling is there because registration needs no credentials and each one writes to KV. |
-
-On the Workers **Free** plan a further ceiling applies: 50 outbound requests per invocation. A wide read spends one per message, so `search_messages` and `list_drafts` want `maxResults` at 45 or below there; above it the surplus comes back as per-message errors rather than results. The paid plan allows 1000.
-
-Raise either and redeploy. Cloudflare's rate limiter reads its ceiling from the
-binding at build time, so the `simple.limit` on each is the only place that
-changes it. A
-single-user deployment can leave both alone — normal assistant use sits far
-below them.
-
----
-
-## Security
-
-Self-hosting moves the trust question rather than removing it, so here is where everything sits.
-
-- **Your tokens stay yours.** Refresh tokens are encrypted inside their OAuth grant in your KV namespace. A session's Durable Object holds the hour-lived access token, and the MCP agent framework keeps a copy of the grant there for as long as the object lives, refresh token included. Both stores are your own Cloudflare account, encrypted at rest. Mail is never stored — it passes through.
-- **One session, one mailbox.** The MCP session is bound to the account that opened it, so a grant for one mailbox cannot act on another through a borrowed session id.
-- **Scope minimalism.** `gmail.modify` covers reading, sending, labels, and trash. It excludes permanent deletion and all of `gmail.settings.*`, keeping auto-forwarding rules and filter exfiltration — the classic mailbox backdoors — outside what any stolen grant could do. Two read-only scopes are requested alongside it, `userinfo.email` and `userinfo.profile`: they are how the allowlist and the session binding know which account signed in, and they reach no mail.
-- **Headers cannot be smuggled.** Every outgoing header value is rejected if it contains CR, LF or NUL, so no argument can break out of its own field to append one — a `Bcc` inside a subject line, say. Media types are validated, and quoted history is HTML-escaped. What this does not do is police the arguments themselves: `bcc` is a real parameter, so a model acting on an instruction hidden in a message body could still fill it in, and your client's approval prompt remains the check on that.
-- **Access can be withdrawn.** Narrowing `ALLOWED_EMAILS` stops new sign-ins. A single account's access is revoked at [myaccount.google.com/connections](https://myaccount.google.com/connections). Rotating the Google client secret invalidates every grant at once.
-
-The Worker decrypts mail in memory while serving a request, as any hosted relay must. If that is unacceptable for a particular mailbox, run a local MCP server for that one.
-
----
-
-## How it was tested
-
-260 unit tests cover message construction (MIME nesting, RFC 2047 folding, RFC 2231 filenames, CR/LF rejection, base64 wrapping), body extraction across charsets, reply and forward composition, the Google token flows, the sign-in allowlist, the CSRF and state-binding checks that guard the browser side of sign-in, and the tools themselves against a stand-in Gmail — session ownership, recipient composition, attachment selection, and what a partly-failed read returns.
-
-Beyond that, every tool has run against real Gmail accounts, with a separate account checking what arrived:
-
-| Area | Result |
-| :-- | :-- |
-| Encoding | Japanese subjects folded across encoded words; emoji, ZWJ sequences, RTL Arabic, combining marks, and rare CJK round-tripped unchanged |
-| Attachments | A CSV named `請求書.csv` sent, delivered, and downloaded back byte-identical; an inline `cid:` image rendered by the recipient; a 2 MB zip fetched through a download link arrived at its declared size and opened |
-| Threading | `reply_all` addressed the sender, kept the third-party `Cc`, dropped its own address, and quoted the original in the same thread |
-| Two accounts | Both connected to one deployment at once; a message id from one returned `404` on the other |
-| Organizing | A nested CJK label created, renamed, applied by batch, and deleted; thread and message trash both reversed |
-| Scale | A 15,000-message mailbox searched with Gmail operators and pagination without tripping a rate limit |
-
----
-
-## Development
+## Hacking on it
 
 ```sh
-bun run dev     # wrangler dev on :8788
-bun run check   # biome + tsrs
-bun test        # 260 unit tests
-bun run assets  # regenerate the light and dark diagrams
-bun run deploy
+bun run check   # biome and type checks
+bun test        # 418 tests
+./node_modules/.bin/wrangler deploy --dry-run --outdir /tmp/gm-dry
+python3 scripts/check-counts.py
 ```
 
-## Questions and bugs
+[CLAUDE.md](./CLAUDE.md) covers how it's put together, the safety rules that must never regress and how to pull in changes from upstream.
 
-Open an [issue](https://github.com/mkpoli/gmail-mcp/issues).
+## Credit
 
----
+This started as a fork of [mkpoli/gmail-mcp](https://github.com/mkpoli/gmail-mcp) and mkpoli did the hard part. That includes the MCP server, all 27 Gmail tools, the MIME and charset handling and the OAuth plumbing. Give it a star.
+
+I narrowed it to one job, being the second Gmail connector for Claude and tightened it up for that. I had the whole thing reviewed before I trusted it with my own mail, fixed everything the review turned up and wrote a test for each fix. [CHANGELOG.md](./CHANGELOG.md) has the full list. If you find something I missed, please tell me privately first. [SECURITY.md](./SECURITY.md) explains how.
 
 ## License
 
-Copyright © 2026 mkpoli. Released under the [MIT License](./LICENSE).
+MIT. Copyright © 2026 mkpoli and Copyright © 2026 Kyle Conway for the changes in this fork. See [LICENSE](./LICENSE).
 
-`src/workers-oauth-utils.ts` is derived from the [remote-mcp-github-oauth demo](https://github.com/cloudflare/ai/tree/main/demos/remote-mcp-github-oauth) in [cloudflare/ai](https://github.com/cloudflare/ai), Copyright © 2025 Cloudflare, Inc., used under the MIT License. See [THIRD-PARTY.md](./THIRD-PARTY.md).
+`src/workers-oauth-utils.ts` comes from Cloudflare's [remote-mcp-github-oauth demo](https://github.com/cloudflare/ai/tree/main/demos/remote-mcp-github-oauth), Copyright © 2025 Cloudflare, Inc., under the MIT License. See [THIRD-PARTY.md](./THIRD-PARTY.md).

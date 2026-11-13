@@ -174,3 +174,6 @@ wrangler.local.jsonc
 
 # local markdown preview
 _preview-*.html
+
+# Deployment notes kept out of the repository
+DEPLOYMENT.local.md

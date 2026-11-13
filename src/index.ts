@@ -1,5 +1,7 @@
+import { env as workerEnv } from "cloudflare:workers";
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { getAgentByName } from "agents";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
@@ -41,7 +43,15 @@ import {
 	truncate,
 } from "./gmail";
 import { GoogleHandler } from "./google-handler";
-import { BodyTooLarge, type Props, readBoundedBody, refreshGoogleToken } from "./utils";
+import {
+	BodyTooLarge,
+	type Props,
+	rateLimitKey,
+	readBoundedBody,
+	refreshGoogleToken,
+	registrationRefusal,
+} from "./utils";
+import { signData, verifySignature } from "./workers-oauth-utils";
 
 type TokenCache = { accessToken: string; expiresAt: number };
 
@@ -81,8 +91,25 @@ const ATTACHMENT_INLINE_LIMIT = 200_000;
 const ACCOUNT_HEADER = "x-gmail-mcp-account";
 // How the agent framework will accept a grant if one is written on the request.
 const PROPS_HEADER = "x-partykit-props";
-// The headers a message summary is built from; nothing else is read.
-const SUMMARY_HEADERS = ["From", "To", "Cc", "Subject", "Date"] as const;
+// The headers a message summary is built from; nothing else is read. Reply-To
+// is among them because a reply follows it, and a Bcc because a draft or a
+// sent message keeps one that no other header shows.
+const SUMMARY_HEADERS = ["From", "Reply-To", "To", "Cc", "Bcc", "Subject", "Date"] as const;
+
+// What each tool does, as MCP annotations. A client decides from these which
+// calls may run without asking, and a tool that declares nothing counts as a
+// destructive write reaching outside the account: reads and sends then sit in
+// one group, and allowing the searches allows the sends with them. A read of
+// mail keeps the open-world default because what it returns was written by
+// whoever sent it.
+const HINTS = {
+	read: { readOnlyHint: true },
+	readAccount: { readOnlyHint: true, openWorldHint: false },
+	send: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+	destructive: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+	additive: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+} satisfies Record<string, ToolAnnotations>;
+
 // How long the account's send-as identities are trusted before being read again.
 const SEND_AS_TTL_MS = 24 * 60 * 60 * 1000;
 // What the MCP transport itself allows a single message to be.
@@ -119,8 +146,10 @@ type StagedMeta = {
 	padding: number;
 };
 
-// How long a download link answers after get_attachment hands it out.
-const DOWNLOAD_TTL_MS = 60 * 60 * 1000;
+// How long a download link answers after get_attachment hands it out. The
+// first fetch spends it, so this bounds only how long an unused one is worth
+// something to whoever finds it in a transcript, a message or a log.
+const DOWNLOAD_TTL_MS = 10 * 60 * 1000;
 
 // What a download link points at. The message is read again when the link is
 // fetched, since Gmail reissues attachment ids on every read; the part is
@@ -132,6 +161,16 @@ type DownloadMeta = {
 	secret: string;
 	at: number;
 };
+
+// What the secret in an upload or download URL is an HMAC of: the route, the
+// session the URL names, and the file within it. Keyed with the cookie key,
+// so the Worker can tell an address this deployment minted from a guess
+// without waking the session it names. The prefix keeps these apart from the
+// approval payloads signed with the same key, which are JSON or base64 and
+// never start with a word and a colon.
+function fileAddress(kind: "upload" | "download", name: string, id: string): string {
+	return `${kind}:${name}/${id}`;
+}
 
 const filePartSchema = z.object({
 	filename: z.string().optional().describe("Required with content; a staged file brings its own"),
@@ -186,6 +225,44 @@ function assertForwardable(files: { filename: string; size: number }[]): void {
 	}
 }
 
+// A send can wait on an approval that shows the call's arguments, and who a
+// reply or a draft reaches is not among them: a reply works its recipients
+// out, from Reply-To when the original sets one, and a draft carries whatever
+// was last written to it, Bcc included. Asking for them, and refusing a list
+// that differs, puts every address in front of whoever approves. They compare
+// as mailboxes, so a tag or a Gmail dot does not make a different person.
+// Folding a tag drops whatever follows the "+", so a stated entry has to be
+// one bare address: "billing+pat@client.example@gmail.com" would otherwise
+// match billing@gmail.com while the approval showed the client's address.
+function assertSameRecipients(actual: string[], stated: string[]): void {
+	const unplain = stated.filter((entry) => !/^[^\s@<>()",;:]+@[^\s@<>()",;:]+$/.test(entry.trim()));
+	if (unplain.length > 0) {
+		throw new Error(
+			`nothing was sent: recipients takes one bare address per entry, and ${unplain.join(", ")} is not one`,
+		);
+	}
+	const reached = new Set(actual.map(canonicalAddress));
+	const named = new Set(stated.map(canonicalAddress));
+	if (reached.size !== named.size || [...reached].some((address) => !named.has(address))) {
+		throw new Error(
+			`nothing was sent: this would reach ${[...new Set(actual)].join(", ") || "nobody"}. Pass exactly those addresses as recipients to send it`,
+		);
+	}
+}
+
+// Trash and Spam are where mail waits to be purged: Gmail empties both after
+// 30 days. The label tools read as filing, which makes them the ones a person
+// allows without asking, and one call reaches a thousand messages. Disposal
+// goes through the tools whose names say what they do.
+function assertLabelsOnly(addLabelIds: string[]): void {
+	const disposal = addLabelIds.filter((id) => ["TRASH", "SPAM"].includes(id.trim().toUpperCase()));
+	if (disposal.length > 0) {
+		throw new Error(
+			`${disposal.join(" and ")} cannot be added with a label tool; move mail to the trash with trash_message or trash_thread, and mark spam in Gmail`,
+		);
+	}
+}
+
 export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 	server = new McpServer({
 		name: "Gmail MCP",
@@ -195,9 +272,9 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 	// The account this object serves, from the header the OAuth boundary stamps.
 	private callerAccount: string | null = null;
 
-	// Where this deployment answers, read off arriving traffic. It names the
-	// host in upload URLs, which is the one thing a Worker cannot know about
-	// itself without being told.
+	// Where this deployment answers, read off arriving MCP traffic. It names the
+	// host in upload and download URLs, which is the one thing a Worker cannot
+	// know about itself without being told.
 	private origin: string | null = null;
 
 	// A session belongs to the first account that opens it. Durable Object
@@ -206,7 +283,6 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 	// for a second account to read no owner and be admitted.
 	override async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
-		this.origin = url.origin;
 		// A staged upload authenticates by its address alone: the boundary sends
 		// it here without a grant, and the secret in the path is what
 		// stage_attachment_begin handed the session that asked for it.
@@ -217,6 +293,10 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		if (url.pathname.startsWith("/download/")) {
 			return this.serveDownload(request, url);
 		}
+		// Learned only from MCP traffic, which reached this object through the
+		// OAuth boundary. A file address carries no grant, and the scheme and
+		// host it came in on would otherwise be those of every link minted next.
+		this.origin = url.origin;
 		const account = request.headers.get(ACCOUNT_HEADER)?.toLowerCase();
 		if (account) {
 			const owner = await this.ctx.storage.get<string>("owner");
@@ -474,7 +554,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			messageId,
 			index,
 			filename: part.filename,
-			secret: crypto.randomUUID(),
+			secret: await signData(fileAddress("download", name, id), this.env.COOKIE_ENCRYPTION_KEY),
 			at: Date.now(),
 		};
 		await this.ctx.storage.put(`download:${id}`, offer);
@@ -496,21 +576,27 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		}
 	}
 
-	// The link half of a download. A wrong id, a wrong secret and an expired
-	// link answer alike. The bytes go out as an opaque download whatever the
-	// sender called them: this origin also serves the sign-in pages, and an
-	// attachment rendered here as HTML would run on it.
+	// The link half of a download. A wrong id, a wrong secret, an expired link
+	// and a spent one answer alike. The bytes go out as an opaque download
+	// whatever the sender called them: this origin also serves the sign-in
+	// pages, and an attachment rendered here as HTML would run on it.
 	private async serveDownload(request: Request, url: URL): Promise<Response> {
 		if (request.method !== "GET") {
 			return new Response("GET a download URL", { status: 405 });
 		}
 		const [, , , id, secret] = url.pathname.split("/").map(decodeURIComponent);
 		const offer = id ? await this.ctx.storage.get<DownloadMeta>(`download:${id}`) : undefined;
-		// The secret is an unguessable 122-bit UUID compared against storage this
-		// object alone reads, so equality is the whole check.
+		// The Worker let this through only because the secret signs this address,
+		// which takes the deployment's key. Matching the stored copy keeps a second
+		// lock on it; whether the offer is still alive is for this object to say.
 		if (!offer || offer.secret !== secret || Date.now() - offer.at > DOWNLOAD_TTL_MS) {
 			return new Response("no download answers to this address", { status: 404 });
 		}
+		// A link serves one fetch, so one that turns up later in a message or a
+		// log opens nothing. It is spent before Gmail is read: a second request
+		// arriving meanwhile finds nothing either, and a fetch that fails is
+		// retried with a fresh link from get_attachment.
+		await this.ctx.storage.delete(`download:${id}`);
 		let data: string;
 		try {
 			const message = await this.api<GmailMessage>(
@@ -557,8 +643,9 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		const meta = stagingId
 			? await this.ctx.storage.get<StagedMeta>(`staged:${stagingId}`)
 			: undefined;
-		// The secret is an unguessable 122-bit UUID compared against storage this
-		// object alone reads, so equality is the whole check.
+		// The Worker let this through only because the secret signs this address,
+		// which takes the deployment's key. Matching the stored copy keeps a second
+		// lock on it; whether the staging is still open is for this object to say.
 		if (!meta || meta.secret !== secret || Date.now() - meta.at > STAGED_TTL_MS) {
 			return new Response("no staging answers to this address", { status: 404 });
 		}
@@ -901,16 +988,19 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		const reply = await this.replyContext(replyToMessageId);
 		// A caller that names its own recipients owns all of them: mixing a
 		// written To with a derived Cc would copy people the caller chose to
-		// leave out.
+		// leave out. A Cc the caller wrote is kept whatever else is derived;
+		// replacing it copied the original's whole audience and dropped the
+		// person the caller asked for.
 		const derived = to === undefined;
 		const finalTo = derived ? reply.to.join(", ") : to;
-		if (!finalTo.trim() && !cc?.trim() && !bcc?.trim()) {
+		const finalCc = cc ?? (derived && reply.cc.length > 0 ? reply.cc.join(", ") : undefined);
+		if (!finalTo.trim() && !finalCc?.trim() && !bcc?.trim()) {
 			throw new Error("this reply has no recipient other than this account; pass to explicitly");
 		}
 		const raw = b64urlEncode(
 			buildRfc822({
 				to: finalTo,
-				cc: derived ? (reply.cc.length > 0 ? reply.cc.join(", ") : undefined) : cc,
+				cc: finalCc,
 				bcc,
 				from: from ?? reply.from,
 				subject: subject ?? reply.subject,
@@ -928,11 +1018,14 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			method: "POST",
 			body: JSON.stringify({ message: { raw, threadId: reply.original.threadId } }),
 		});
+		// The whole envelope, because a draft sent later reaches all of it.
 		return this.text({
 			draftId: d.id,
 			messageId: d.message?.id,
 			threadId: d.message?.threadId,
 			to: finalTo,
+			cc: finalCc,
+			bcc,
 		});
 	}
 
@@ -947,6 +1040,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"whoami",
 			`Show which Gmail account this connection is bound to (${account})`,
 			{},
+			HINTS.readAccount,
 			async () => this.text(await this.api("/profile")),
 		);
 
@@ -958,14 +1052,17 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				maxResults: z.number().int().min(1).max(50).default(10),
 				pageToken: z.string().optional().describe("nextPageToken from a previous search"),
 			},
+			HINTS.read,
 			async ({ query, maxResults, pageToken }) => {
 				const params = new URLSearchParams({ q: query, maxResults: String(maxResults) });
 				if (pageToken) params.set("pageToken", pageToken);
 				const list = await this.api<MessageList>(`/messages?${params}`);
 				const ids = (list.messages ?? []).map((m) => m.id ?? "").filter(Boolean);
+				// Named from the list the summary reads, so a header the summary
+				// shows is never one this search left out.
 				const messages = await this.mapLimited(ids, 8, (id) =>
 					this.api<GmailMessage>(
-						`/messages/${encodeURIComponent(id)}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Subject&metadataHeaders=Date`,
+						`/messages/${encodeURIComponent(id)}?format=metadata${SUMMARY_HEADERS.map((h) => `&metadataHeaders=${h}`).join("")}`,
 					),
 				);
 				return this.text({
@@ -982,6 +1079,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"get_message",
 			`Read a full message from ${account}, including decoded body text`,
 			{ messageId: z.string() },
+			HINTS.read,
 			async ({ messageId }) => {
 				const m = await this.api<GmailMessage>(
 					`/messages/${encodeURIComponent(messageId)}?format=full`,
@@ -1012,9 +1110,10 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					.default(10)
 					.describe("Newest messages are kept when a thread exceeds this"),
 			},
+			HINTS.read,
 			async ({ threadId, includeBodies, maxMessages }) => {
 				// A metadata read returns every header of every message — Received
-				// chains, DKIM and ARC signatures, List-* — where five are read.
+				// chains, DKIM and ARC signatures, List-* — where a handful are read.
 				// Naming them turns a long thread from megabytes into kilobytes,
 				// which is what makes this the escape hatch the size error promises.
 				const threadQuery = includeBodies
@@ -1068,20 +1167,28 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			},
 		);
 
-		this.server.tool("list_labels", `List labels in ${account}`, {}, async () => {
-			const l = await this.api<LabelList>("/labels");
-			return this.text((l.labels ?? []).map((x) => ({ id: x.id, name: x.name, type: x.type })));
-		});
+		this.server.tool(
+			"list_labels",
+			`List labels in ${account}`,
+			{},
+			HINTS.readAccount,
+			async () => {
+				const l = await this.api<LabelList>("/labels");
+				return this.text((l.labels ?? []).map((x) => ({ id: x.id, name: x.name, type: x.type })));
+			},
+		);
 
 		this.server.tool(
 			"modify_labels",
-			`Add or remove labels on a message in ${account} (also archives: remove INBOX; marks read: remove UNREAD)`,
+			`Add or remove labels on a message in ${account} (also archives: remove INBOX; marks read: remove UNREAD). TRASH and SPAM cannot be added here; trash_message trashes`,
 			{
 				messageId: z.string(),
 				addLabelIds: z.array(z.string()).default([]),
 				removeLabelIds: z.array(z.string()).default([]),
 			},
+			HINTS.destructive,
 			async ({ messageId, addLabelIds, removeLabelIds }) => {
+				assertLabelsOnly(addLabelIds);
 				// The modify/trash responses carry no payload, so headers would be
 				// empty; report the label state that actually changed.
 				const m = await this.api(`/messages/${encodeURIComponent(messageId)}/modify`, {
@@ -1096,6 +1203,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"trash_message",
 			`Move a message to the trash in ${account} (reversible for 30 days)`,
 			{ messageId: z.string() },
+			HINTS.destructive,
 			async ({ messageId }) => {
 				const m = await this.api(`/messages/${encodeURIComponent(messageId)}/trash`, {
 					method: "POST",
@@ -1132,6 +1240,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					.default(true)
 					.describe("When replying, quote the original under the body"),
 			},
+			HINTS.additive,
 			async ({ replyToMessageId, quote, to, subject, body, ...rest }) => {
 				if (replyToMessageId) {
 					return this.createReplyDraft({ replyToMessageId, quote, to, subject, body, ...rest });
@@ -1155,7 +1264,13 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					method: "POST",
 					body: JSON.stringify({ message: { raw } }),
 				});
-				return this.text({ draftId: d.id, messageId: d.message?.id });
+				return this.text({
+					draftId: d.id,
+					messageId: d.message?.id,
+					to,
+					cc: rest.cc,
+					bcc: rest.bcc,
+				});
 			},
 		);
 
@@ -1186,6 +1301,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					.optional()
 					.describe("Omit to keep the images the draft's HTML shows; [] removes them"),
 			},
+			HINTS.destructive,
 			async ({
 				draftId,
 				to,
@@ -1202,11 +1318,21 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					`/drafts/${encodeURIComponent(draftId)}?format=full`,
 				);
 				const m = current.message ?? {};
-				// Headers went out encoded and come back encoded; the builder encodes
-				// again, so they have to be read back to text first.
+				// A subject went out encoded and comes back encoded; the builder
+				// encodes again, so it has to be read back to text first.
 				const existing = (name: string) => {
 					const value = headerValue(m, name);
 					return value === undefined ? undefined : decodeEncodedWords(value);
+				};
+				// Address headers go back as Gmail holds them, unfolded. Decoding one
+				// exposes whatever a display name carried, a comma or a whole second
+				// address, and the builder splits the list on it, so a name became a
+				// recipient. The builder leaves an encoded name as it is.
+				const written = (name: string) => headerValue(m, name)?.replace(/\r?\n[ \t]+/g, " ");
+				const recipients = {
+					to: to ?? written("To") ?? "",
+					cc: cc ?? written("Cc"),
+					bcc: bcc ?? written("Bcc"),
 				};
 
 				// The readable text is one unit in two renderings. Replacing only one
@@ -1234,10 +1360,8 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 				const raw = b64urlEncode(
 					buildRfc822({
-						to: to ?? existing("To") ?? "",
-						cc: cc ?? existing("Cc"),
-						bcc: bcc ?? existing("Bcc"),
-						from: from ?? existing("From"),
+						...recipients,
+						from: from ?? written("From"),
 						subject: subject ?? existing("Subject") ?? "",
 						body: text.body,
 						htmlBody: text.htmlBody,
@@ -1253,10 +1377,13 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 						message: { raw, ...(m.threadId ? { threadId: m.threadId } : {}) },
 					}),
 				});
+				// Who the draft reaches, kept or changed, so a caller that only edited
+				// the text still sees where it will go.
 				return this.text({
 					draftId: d.id,
 					messageId: d.message?.id,
 					threadId: d.message?.threadId,
+					...recipients,
 					attachments: files.map((f) => f.filename),
 				});
 			},
@@ -1264,9 +1391,27 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"send_draft",
-			`Send an existing draft from ${account}`,
-			{ draftId: z.string() },
-			async ({ draftId }) => {
+			`Send an existing draft from ${account}. recipients must list every address on the draft, To, Cc and Bcc together (list_drafts shows all three); a list that differs is refused with the real one, and nothing is sent`,
+			{
+				draftId: z.string(),
+				recipients: z
+					.array(z.string())
+					.describe("Every address the draft goes to: To, Cc and Bcc together, bare addresses"),
+			},
+			HINTS.send,
+			async ({ draftId, recipients }) => {
+				const d = await this.api<DraftResult>(
+					`/drafts/${encodeURIComponent(draftId)}?format=metadata&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc`,
+				);
+				// Every occurrence is read: another client may have written a field
+				// twice, and a check that stopped at the first would pass over
+				// whoever the second one names. The draft is read and sent in two
+				// calls, so a change landing between them goes unchecked; the window
+				// is one request long.
+				const actual = (d.message?.payload?.headers ?? [])
+					.filter((h) => ["to", "cc", "bcc"].includes(h.name?.toLowerCase() ?? ""))
+					.flatMap((h) => parseAddresses(h.value, { strict: true }));
+				assertSameRecipients(actual, recipients);
 				const m = await this.api("/drafts/send", {
 					method: "POST",
 					body: JSON.stringify({ id: draftId }),
@@ -1279,6 +1424,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"delete_draft",
 			`Delete a draft in ${account} permanently (drafts have no trash)`,
 			{ draftId: z.string() },
+			HINTS.destructive,
 			async ({ draftId }) => {
 				await this.api(`/drafts/${encodeURIComponent(draftId)}`, { method: "DELETE" });
 				return this.text({ deleted: draftId });
@@ -1292,6 +1438,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				maxResults: z.number().int().min(1).max(50).default(10),
 				pageToken: z.string().optional().describe("nextPageToken from a previous listing"),
 			},
+			HINTS.read,
 			async ({ maxResults, pageToken }) => {
 				// Without a page token the drafts past the first page cannot be
 				// reached at all: the listing is the only place their ids appear.
@@ -1300,15 +1447,20 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				const l = await this.api<DraftList & { nextPageToken?: string }>(`/drafts?${draftParams}`);
 				const drafts = l.drafts ?? [];
 				// The list response carries ids only, which say nothing about which
-				// draft is which; pull the headers that identify them.
+				// draft is which; pull the headers that identify them. Cc and Bcc are
+				// among them because sending a draft reaches them too, and Reply-To
+				// because the answers to it go there.
 				const detailed = await this.mapLimited(drafts, 8, async (d) => {
 					const full = await this.api<{ message?: GmailMessage }>(
-						`/drafts/${encodeURIComponent(d.id ?? "")}?format=metadata&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Subject&metadataHeaders=Date`,
+						`/drafts/${encodeURIComponent(d.id ?? "")}?format=metadata&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc&metadataHeaders=Reply-To&metadataHeaders=Subject&metadataHeaders=Date`,
 					);
 					return {
 						draftId: d.id,
 						messageId: full.message?.id,
 						to: headerValue(full.message, "To"),
+						cc: headerValue(full.message, "Cc"),
+						bcc: headerValue(full.message, "Bcc"),
+						replyTo: headerValue(full.message, "Reply-To"),
 						subject: headerValue(full.message, "Subject"),
 						date: headerValue(full.message, "Date"),
 						snippet: full.message?.snippet,
@@ -1325,6 +1477,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 				filename: z.string(),
 				contentType: z.string().describe("Media type, e.g. application/pdf"),
 			},
+			HINTS.additive,
 			async ({ filename, contentType }) => {
 				await this.assertSessionOwner();
 				await this.assertWithinRate();
@@ -1343,10 +1496,15 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					);
 				}
 				const stagingId = crypto.randomUUID();
+				const name = this.ctx.id.name;
 				const meta: StagedMeta = {
 					filename,
 					contentType,
-					secret: crypto.randomUUID(),
+					// A session with no name hands out no upload URL, so there is no
+					// address to sign and this secret is never shown to anyone.
+					secret: name
+						? await signData(fileAddress("upload", name, stagingId), this.env.COOKIE_ENCRYPTION_KEY)
+						: crypto.randomUUID(),
 					at: Date.now(),
 					sealed: false,
 					chunks: 0,
@@ -1354,7 +1512,6 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					padding: 0,
 				};
 				await this.ctx.storage.put(`staged:${stagingId}`, meta);
-				const name = this.ctx.id.name;
 				const uploadUrl =
 					this.origin && name
 						? `${this.origin}/upload/${encodeURIComponent(name)}/${stagingId}/${meta.secret}`
@@ -1379,6 +1536,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					.string()
 					.describe("Standard base64; every chunk before the last must carry no padding"),
 			},
+			HINTS.additive,
 			async ({ stagingId, content }) => {
 				await this.assertSessionOwner();
 				await this.assertWithinRate();
@@ -1417,6 +1575,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"stage_attachment_finish",
 			`Seal a staged attachment in ${account} so messages and drafts can attach it by stagingId`,
 			{ stagingId: z.string() },
+			HINTS.additive,
 			async ({ stagingId }) => {
 				await this.assertSessionOwner();
 				await this.assertWithinRate();
@@ -1448,6 +1607,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 						"Message-ID header value of the message being replied to; a Gmail message id is resolved to it",
 					),
 			},
+			HINTS.send,
 			async ({
 				to,
 				subject,
@@ -1495,23 +1655,36 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"reply_all",
-			`Reply to a message in ${account}, addressing every original recipient except this account, with the original quoted`,
+			`Reply to a message in ${account}, addressing every original recipient except this account, with the original quoted. When the original sets Reply-To, the reply goes to that address instead of its From. recipients must list every address the reply reaches, To and Cc together; a list that differs is refused with the real one, and nothing is sent`,
 			{
 				messageId: z.string().describe("The message being replied to"),
+				recipients: z
+					.array(z.string())
+					.describe("Every address the reply goes to: To and Cc together, bare addresses"),
 				body: z.string().describe("Plain-text reply, without quoted history"),
 				htmlBody: z.string().optional().describe("HTML reply, without quoted history"),
 				attachments: z.array(filePartSchema).default([]),
 				inlineImages: z.array(inlineImageSchema).default([]),
 			},
-			async ({ messageId, body, htmlBody, attachments, inlineImages }) => {
+			HINTS.send,
+			async ({ messageId, recipients, body, htmlBody, attachments, inlineImages }) => {
 				const reply = await this.replyContext(messageId);
 				if (reply.to.length === 0) {
 					throw new Error("reply_all found no recipient other than this account");
 				}
+				const to = reply.to.join(", ");
+				const cc = reply.cc.length > 0 ? reply.cc.join(", ") : undefined;
+				// Read back from the headers as they will be written, the way Gmail
+				// will read them: an address the original carried with a comma or a
+				// quote inside it is counted as what it turns into on the way out.
+				assertSameRecipients(
+					[to, cc].flatMap((header) => parseAddresses(header, { strict: true })),
+					recipients,
+				);
 				const raw = b64urlEncode(
 					buildRfc822({
-						to: reply.to.join(", "),
-						cc: reply.cc.length > 0 ? reply.cc.join(", ") : undefined,
+						to,
+						cc,
 						from: reply.from,
 						subject: reply.subject,
 						body: `${body}\n\n${reply.quotedPlain}`,
@@ -1546,6 +1719,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 						"Re-attach the original's files. A forward that cannot carry all of them is refused, not sent without them",
 					),
 			},
+			HINTS.send,
 			async ({ messageId, to, cc, body, htmlBody, includeAttachments }) => {
 				const original = await this.api<GmailMessage>(
 					`/messages/${encodeURIComponent(messageId)}?format=full`,
@@ -1621,7 +1795,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"get_attachment",
-			`Download an attachment from a message in ${account}. Returns base64 while it stays small enough to read, and text types decoded; a larger file comes back as a downloadUrl to fetch with curl -o <file> '<downloadUrl>', valid for ${DOWNLOAD_TTL_MS / 60_000} minutes while this session stays open`,
+			`Download an attachment from a message in ${account}. Returns base64 while it stays small enough to read, and text types decoded; a larger file comes back as a downloadUrl that serves it once: fetch it with curl -o <file> '<downloadUrl>' within ${DOWNLOAD_TTL_MS / 60_000} minutes while this session stays open, or call this again for a fresh link`,
 			{
 				messageId: z.string(),
 				attachmentId: z
@@ -1636,6 +1810,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 					.default(false)
 					.describe("Return only decoded text for text/* attachments, no base64"),
 			},
+			HINTS.read,
 			async ({ messageId, attachmentId, filename, textOnly }) => {
 				// The part's declared type decides whether decoding to text is
 				// meaningful; decoding a PDF as UTF-8 would return pages of noise.
@@ -1722,6 +1897,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"untrash_message",
 			`Restore a message from the trash in ${account}`,
 			{ messageId: z.string() },
+			HINTS.additive,
 			async ({ messageId }) => {
 				const m = await this.api(`/messages/${encodeURIComponent(messageId)}/untrash`, {
 					method: "POST",
@@ -1732,13 +1908,15 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"modify_thread_labels",
-			`Add or remove labels on every message of a thread in ${account}`,
+			`Add or remove labels on every message of a thread in ${account}. TRASH and SPAM cannot be added here; trash_thread trashes`,
 			{
 				threadId: z.string(),
 				addLabelIds: z.array(z.string()).default([]),
 				removeLabelIds: z.array(z.string()).default([]),
 			},
+			HINTS.destructive,
 			async ({ threadId, addLabelIds, removeLabelIds }) => {
+				assertLabelsOnly(addLabelIds);
 				const t = await this.api<{ id?: string; messages?: GmailMessage[] }>(
 					`/threads/${encodeURIComponent(threadId)}/modify`,
 					{
@@ -1754,6 +1932,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"trash_thread",
 			`Move a whole thread to the trash in ${account} (reversible for 30 days)`,
 			{ threadId: z.string() },
+			HINTS.destructive,
 			async ({ threadId }) => {
 				const t = await this.api(`/threads/${encodeURIComponent(threadId)}/trash`, {
 					method: "POST",
@@ -1766,6 +1945,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"untrash_thread",
 			`Restore a whole thread from the trash in ${account}`,
 			{ threadId: z.string() },
+			HINTS.additive,
 			async ({ threadId }) => {
 				const t = await this.api(`/threads/${encodeURIComponent(threadId)}/untrash`, {
 					method: "POST",
@@ -1776,13 +1956,15 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"batch_modify_messages",
-			`Add or remove labels on up to 1000 messages of ${account} in one call (archive: remove INBOX; mark read: remove UNREAD)`,
+			`Add or remove labels on up to 1000 messages of ${account} in one call (archive: remove INBOX; mark read: remove UNREAD). TRASH and SPAM cannot be added here; trash_message and trash_thread trash`,
 			{
 				messageIds: z.array(z.string()).min(1).max(1000),
 				addLabelIds: z.array(z.string()).default([]),
 				removeLabelIds: z.array(z.string()).default([]),
 			},
+			HINTS.destructive,
 			async ({ messageIds, addLabelIds, removeLabelIds }) => {
+				assertLabelsOnly(addLabelIds);
 				await this.api("/messages/batchModify", {
 					method: "POST",
 					body: JSON.stringify({ ids: messageIds, addLabelIds, removeLabelIds }),
@@ -1795,6 +1977,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"create_label",
 			`Create a label in ${account}`,
 			{ name: z.string().describe("Nested labels use '/', e.g. Projects/Website") },
+			HINTS.additive,
 			async ({ name }) => {
 				const l = await this.api("/labels", {
 					method: "POST",
@@ -1812,6 +1995,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"update_label",
 			`Rename a label in ${account}`,
 			{ labelId: z.string(), name: z.string() },
+			HINTS.additive,
 			async ({ labelId, name }) => {
 				const l = await this.api(`/labels/${encodeURIComponent(labelId)}`, {
 					method: "PATCH",
@@ -1825,6 +2009,7 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"delete_label",
 			`Delete a label in ${account} (messages keep their other labels)`,
 			{ labelId: z.string() },
+			HINTS.destructive,
 			async ({ labelId }) => {
 				await this.api(`/labels/${encodeURIComponent(labelId)}`, { method: "DELETE" });
 				return this.text({ deleted: labelId });
@@ -1959,6 +2144,8 @@ const mcpHandler = {
 // Both of these supply one; the declarations do not line up with a plain object.
 type ProviderHandler = { fetch: ExportedHandlerFetchHandler<unknown> };
 
+const CONNECTION_TTL_SECONDS = 10 * 365 * 24 * 60 * 60;
+
 const provider = new OAuthProvider({
 	apiHandlers: {
 		"/mcp": mcpHandler as unknown as ProviderHandler,
@@ -1970,14 +2157,20 @@ const provider = new OAuthProvider({
 	// Registration is open to any client, so the code exchange must carry real
 	// cryptographic proof: plain PKCE offers none.
 	allowPlainPKCE: false,
-	// A grant's lifetime is fixed when it is issued and refreshing does not extend
-	// it, so the library's 30-day default disconnects every client monthly, an
-	// unattended one without anyone noticing.
-	refreshTokenTTL: 365 * 24 * 60 * 60,
-	// A client record lapses 90 days after registering unless told otherwise, and
-	// nothing renews it, so it would take a live grant down with it.
-	// The library documents undefined as "never expires"; its type only says number.
-	clientRegistrationTTL: undefined as unknown as number,
+	// The provider's defaults end every grant 30 days after sign-in and forget
+	// every registered client after 90, signing Claude out on a schedule. A
+	// grant's lifetime is fixed when it is issued and refreshing does not extend
+	// it, so these outlast any real use and a connection ends only when its
+	// Google grant does. Upstream later chose one year and no client expiry; a
+	// finite figure for both keeps a forgotten registration from living forever.
+	refreshTokenTTL: CONNECTION_TTL_SECONDS,
+	clientRegistrationTTL: CONNECTION_TTL_SECONDS,
+	// Unwanted redirects are refused at registration as well as at /authorize,
+	// so a client that could never sign in is never written to KV either. The
+	// callback is not handed the Worker's env, so the setting is read from the
+	// runtime's module-level copy.
+	clientRegistrationCallback: ({ clientMetadata }) =>
+		registrationRefusal(clientMetadata.redirect_uris, workerEnv.ALLOWED_REDIRECT_URIS),
 });
 
 // Both of these are open to anyone holding the URL, and the provider reads a
@@ -2000,11 +2193,13 @@ function bodyLimitFor(path: string): number | null {
 // The two addresses a session mints for files to cross outside tool calls.
 const FILE_ROUTES = {
 	"/upload/": {
+		kind: "upload",
 		method: "PUT",
 		wrongMethod: "PUT the raw file bytes to an upload URL",
 		missing: "no staging answers to this address",
 	},
 	"/download/": {
+		kind: "download",
 		method: "GET",
 		wrongMethod: "GET a download URL",
 		missing: "no download answers to this address",
@@ -2013,9 +2208,11 @@ const FILE_ROUTES = {
 
 // Carries an upload or a download to the session that minted its URL. The
 // path is the whole credential — session name, file id, secret — and the
-// session judges it; out here the bytes are only ever streamed through. The
-// register limiter gates it because the two share a shape: no credentials up
-// front, and each call wakes or writes something that costs the deployment.
+// secret is an HMAC of the rest of it, so the address is judged here and the
+// session judges only whether the file it names is still on offer. Out here
+// the bytes are only ever streamed through. The register limiter gates what
+// passes because the two share a shape: no credentials up front, and each
+// call wakes or writes something that costs the deployment.
 async function fileRoute(
 	request: Request,
 	env: Env,
@@ -2025,9 +2222,25 @@ async function fileRoute(
 	if (request.method !== route.method) {
 		return new Response(route.wrongMethod, { status: 405 });
 	}
-	const segments = path.split("/");
-	const name = decodeURIComponent(segments[2] ?? "");
-	if (segments.length !== 5 || !name) {
+	// A stray % makes decodeURIComponent throw, and an address that cannot be
+	// read opens nothing: it gets the answer any other wrong one does.
+	let segments: string[];
+	try {
+		segments = path.split("/").map(decodeURIComponent);
+	} catch {
+		return new Response(route.missing, { status: 404 });
+	}
+	const [, , name = "", id = "", secret = ""] = segments;
+	// Looking a session up by name wakes an object of that name, and waking
+	// one writes storage that nothing ever clears. A limiter counted per
+	// address and per location cannot hold back a sender who rotates
+	// addresses, so an address this deployment did not mint is refused here,
+	// for the price of one HMAC, before the limiter or any object is reached.
+	if (
+		segments.length !== 5 ||
+		!name ||
+		!(await verifySignature(secret, fileAddress(route.kind, name, id), env.COOKIE_ENCRYPTION_KEY))
+	) {
 		return new Response(route.missing, { status: 404 });
 	}
 	if (env.REGISTER_LIMITER) {
@@ -2037,9 +2250,9 @@ async function fileRoute(
 			return new Response("Too many requests", { status: 429 });
 		}
 	}
-	// A name that never belonged to a session wakes an object with no grant,
-	// which refuses to start at all; from out here that is the same wrong
-	// address as a bad secret, and it gets the same answer.
+	// A session that has since ended wakes with no grant and refuses to start
+	// at all; from out here that is the same wrong address as a bad secret, and
+	// it gets the same answer.
 	try {
 		const session = await getAgentByName<Env, GmailMCP>(env.MCP_OBJECT, name);
 		return await session.fetch(request);
@@ -2062,8 +2275,7 @@ export default {
 		// scarce thing here: enough of them and the grants and tokens of everyone
 		// already connected have nowhere to go.
 		if (path === "/register" && env.REGISTER_LIMITER) {
-			const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
-			const { success } = await env.REGISTER_LIMITER.limit({ key: caller });
+			const { success } = await env.REGISTER_LIMITER.limit({ key: rateLimitKey(request) });
 			if (!success) {
 				return new Response("Too many registration requests", { status: 429 });
 			}

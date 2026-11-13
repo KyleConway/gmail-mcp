@@ -7,10 +7,15 @@ import {
 	exchangeGoogleCode,
 	fetchGoogleUserInfo,
 	getGoogleAuthorizeUrl,
+	isAllowedRedirect,
+	isAutoPinEnabled,
+	isClientAllowed,
 	isEmailAllowed,
 	isUnderAccountCap,
 	type Props,
 	parseLimit,
+	pinKey,
+	rateLimitKey,
 	readBoundedBody,
 } from "./utils";
 import {
@@ -41,6 +46,11 @@ const GOOGLE_SCOPE = [
 // isolate's memory.
 const MAX_APPROVAL_BODY_BYTES = 64 * 1024;
 
+// A signed approval form is otherwise good for ever, and one fetched once could
+// be posted back for a fresh state and a KV write as often as anyone liked. It
+// lasts as long as the CSRF cookie that goes with it.
+const APPROVAL_TTL_MS = 10 * 60 * 1000;
+
 async function readBoundedForm(request: Request, limit: number): Promise<FormData> {
 	const body = await readBoundedBody(request, limit);
 	return new Request(request.url, { method: "POST", headers: request.headers, body }).formData();
@@ -65,6 +75,65 @@ app.get(
 		}),
 );
 
+// The sign-in steps answer anyone holding the URL, and each spends KV: an
+// approval or an auto-approved GET stores a state, and the callback reads and
+// deletes one. Metering them by caller before any handler runs bounds how fast
+// a replay loop can spend the writes that connected accounts' tokens need.
+// This sits on the router rather than in the Worker's wrapper, where /register
+// is metered, because Hono decodes a path before matching it: /%61uthorize
+// reaches the same handler as /authorize, and a check on the raw path would
+// let it by.
+for (const path of ["/authorize", "/callback"]) {
+	app.use(path, async (c, next) => {
+		if (c.env.REGISTER_LIMITER) {
+			const { success } = await c.env.REGISTER_LIMITER.limit({ key: rateLimitKey(c.req.raw) });
+			if (!success) {
+				return c.text("Too many sign-in attempts. Wait a minute, then connect again.", 429);
+			}
+		}
+		await next();
+	});
+}
+
+// What /authorize will not sign in, whoever asks. GET checks a request before
+// it shows the dialog or auto-approves, and POST checks the signed copy again,
+// so a form signed before a check existed, or before the pin was set, is held
+// to the same terms.
+function refusalFor(
+	oauthReqInfo: AuthRequest,
+	settings: { ALLOWED_CLIENT_IDS?: string; ALLOWED_REDIRECT_URIS?: string },
+): { status: 400 | 403; message: string } | null {
+	const allowedClientIds = settings.ALLOWED_CLIENT_IDS;
+	// A code sent anywhere but Claude, or the operator's own list, is a code
+	// someone else redeems.
+	if (!isAllowedRedirect(oauthReqInfo.redirectUri, settings.ALLOWED_REDIRECT_URIS)) {
+		return {
+			status: 400,
+			message: settings.ALLOWED_REDIRECT_URIS?.trim()
+				? "This server only signs in clients whose callback is listed in ALLOWED_REDIRECT_URIS."
+				: "This server only signs in Claude.",
+		};
+	}
+	// The id is echoed because whoever is refused here is most often the owner
+	// after reconnecting, and this page is the handiest place to read it. The
+	// last sentence is for the times it is someone the owner was sent by.
+	if (!isClientAllowed(oauthReqInfo.clientId, allowedClientIds)) {
+		const id = oauthReqInfo.clientId;
+		return {
+			status: 403,
+			message: `This server is pinned to the OAuth clients listed in ALLOWED_CLIENT_IDS, and client ${id} is not one of them. If this sign-in began at Claude's own Connect button, the connector has registered as a new client: run \`wrangler secret put ALLOWED_CLIENT_IDS\` and enter ${id}, after any ids to keep and separated by commas, then connect again. If it began at a link someone sent you, close this page.`,
+		};
+	}
+	// Claude registers as a public client with no secret, so the PKCE challenge
+	// is all that ties a code to the request that asked for it. The provider
+	// lets a request without one through and compares a method it does not
+	// know as plain; Claude always sends S256 with a challenge.
+	if (!oauthReqInfo.codeChallenge || oauthReqInfo.codeChallengeMethod !== "S256") {
+		return { status: 400, message: "This server requires PKCE with S256." };
+	}
+	return null;
+}
+
 app.get("/authorize", async (c) => {
 	// Clients register themselves via /register (dynamic client registration),
 	// and parseAuthRequest throws on a client_id it has never issued. A foreign
@@ -83,6 +152,12 @@ app.get("/authorize", async (c) => {
 	const { clientId } = oauthReqInfo;
 	if (!clientId) {
 		return c.text("Invalid request", 400);
+	}
+	// Ahead of the dialog and the auto-approve alike. The steps after them act on
+	// this same request, carried in the signed form or the stored state.
+	const refusal = refusalFor(oauthReqInfo, c.env);
+	if (refusal) {
+		return c.text(refusal.message, refusal.status);
 	}
 
 	const client = await c.env.OAUTH_PROVIDER.lookupClient(clientId).catch(() => null);
@@ -118,7 +193,7 @@ app.get("/authorize", async (c) => {
 		},
 		setCookie,
 		cookieSecret: env.COOKIE_ENCRYPTION_KEY,
-		state: { oauthReqInfo },
+		state: { oauthReqInfo, issuedAt: Date.now() },
 	});
 });
 
@@ -153,7 +228,7 @@ app.post("/authorize", async (c) => {
 		if (verified === null) {
 			return c.text("Invalid state data", 400);
 		}
-		let state: { oauthReqInfo?: AuthRequest };
+		let state: { oauthReqInfo?: AuthRequest; issuedAt?: number };
 		try {
 			state = JSON.parse(verified);
 		} catch (_e) {
@@ -162,6 +237,15 @@ app.post("/authorize", async (c) => {
 
 		if (!state.oauthReqInfo?.clientId) {
 			return c.text("Invalid request", 400);
+		}
+		// A form signed before it carried a time has no age to check, and is
+		// refused like one that is too old.
+		if (typeof state.issuedAt !== "number" || Date.now() - state.issuedAt > APPROVAL_TTL_MS) {
+			return c.text("This approval has expired. Start the connection again from Claude.", 400);
+		}
+		const refusal = refusalFor(state.oauthReqInfo, c.env);
+		if (refusal) {
+			return c.text(refusal.message, refusal.status);
 		}
 
 		const approvedClientCookie = await addApprovedClient(
@@ -247,6 +331,46 @@ async function consentRetry(
 			"Set-Cookie": setCookie,
 		},
 	});
+}
+
+// Every fresh connection registers a new client, and completeAuthorization
+// retires only the earlier grants of the client signing in. Any other grant,
+// from a connector removed and added again or from an approval someone was
+// talked into, would go on refreshing for the ten years a grant now lasts, and
+// enough of them would push a sign-in past the Free plan's subrequest limit.
+// This deployment keeps one connection per account, so a sign-in retires the
+// rest. It runs once the sign-in has succeeded, and a failure here leaves those
+// grants as they were rather than failing it.
+async function retireOtherGrants(provider: OAuthHelpers, userId: string, clientId: string) {
+	try {
+		const stale: string[] = [];
+		let cursor: string | undefined;
+		do {
+			const page = await provider.listUserGrants(userId, cursor ? { cursor } : undefined);
+			for (const grant of page.items) {
+				if (grant.clientId !== clientId) stale.push(grant.id);
+			}
+			cursor = page.cursor;
+		} while (cursor);
+		const results = await Promise.allSettled(stale.map((id) => provider.revokeGrant(id, userId)));
+		const failed = results.filter((result) => result.status === "rejected").length;
+		if (failed > 0) {
+			console.warn(`could not retire ${failed} of ${stale.length} earlier grants`);
+		}
+	} catch (error) {
+		console.warn("could not retire earlier grants:", error);
+	}
+}
+
+// The person refused here has just proven they own an allowed account, so this
+// is most often the owner after removing and re-adding the connector, and the
+// page says how to move the pin. The last sentence is for the times it is not.
+function pinnedRefusal(pin: string, clientId: string): string {
+	return [
+		`This Google account is pinned to the first OAuth client that completed a sign-in for it, and this sign-in came from a different client, ${clientId}. Nothing was stored.`,
+		`If you removed and re-added this connector in Claude, reset the pin and connect again: run \`wrangler kv key delete "${pin}" --namespace-id <OAUTH_KV id> --remote\` (\`wrangler kv namespace list\` shows the id), or set ALLOWED_CLIENT_IDS to ${clientId} with \`wrangler secret put ALLOWED_CLIENT_IDS\`, which replaces the automatic pin.`,
+		"If this sign-in began at a link someone sent you, close this page and change nothing.",
+	].join("\n\n");
 }
 
 function redirectToGoogle(request: Request, stateToken: string, headers?: Headers) {
@@ -335,6 +459,19 @@ app.get("/callback", async (c) => {
 			return c.text("This Google account is not allowed on this server", 403);
 		}
 
+		// The pin is checked once Google has said whose account this is, since
+		// nothing before that knows, and ahead of anything stored for the sign-in.
+		// claude.ai registers two clients for each Connect and completes sign-in
+		// with only one of them, so a client is pinned for having finished a
+		// sign-in, never for registering: the one that never finishes must not
+		// lock out the one that does.
+		const pinning = isAutoPinEnabled(c.env.PIN_FIRST_CLIENT, c.env.ALLOWED_CLIENT_IDS);
+		const pin = pinKey(user.email);
+		const pinned = pinning ? await c.env.OAUTH_KV.get(pin) : null;
+		if (pinned && pinned !== oauthReqInfo.clientId) {
+			return c.text(pinnedRefusal(pin, oauthReqInfo.clientId), 403);
+		}
+
 		// Count the accounts this deployment has ever admitted, and stop new ones
 		// past the cap. The marker doubles as the "is this account new" answer.
 		const marker = `account:${user.email.toLowerCase()}`;
@@ -373,6 +510,14 @@ app.get("/callback", async (c) => {
 		// here would leave the account counted against the cap for ever without
 		// ever having connected.
 		await c.env.OAUTH_KV.put(marker, new Date().toISOString());
+		// After the grant for the same reason: a pin written ahead of a sign-in
+		// that then failed would hold the account for a client that never
+		// connected.
+		if (pinning && !pinned) {
+			await c.env.OAUTH_KV.put(pin, oauthReqInfo.clientId);
+		}
+
+		await retireOtherGrants(c.env.OAUTH_PROVIDER, user.email, oauthReqInfo.clientId);
 
 		const headers = new Headers({ Location: redirectTo });
 		if (clearSessionCookie) {

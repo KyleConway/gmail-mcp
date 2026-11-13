@@ -579,25 +579,105 @@ export function buildRfc822({
 
 // ---- Reply helpers ----------------------------------------------------------
 
+type AddressEntry = {
+	address: string | undefined;
+	// Whether the address came from an angle-addr closing the entry.
+	angled: boolean;
+	// The entry with its quoted strings and comments blanked out.
+	outside: string;
+	// The quoted strings and comments themselves.
+	hidden: string[];
+	// A quote or a parenthesis that does not pair up.
+	unbalanced: boolean;
+};
+
+// Quoted strings and comments only ever carry a name or a remark, so the
+// address is looked for outside them. Read from the raw entry, a display name
+// such as "Pat <spy@evil.example>" decided who a reply went to, while a mail
+// server delivers to the address after it. Quoted strings go first because a
+// parenthesis inside one opens no comment.
+function readAddressEntry(entry: string): AddressEntry {
+	const hidden: string[] = [];
+	const hide = (text: string) => {
+		hidden.push(text);
+		return " ";
+	};
+	const unquoted = entry.replace(/"(?:[^"\\]|\\.)*"/g, hide);
+	// A comment that nothing closes runs to the end of the entry, as it does in
+	// splitAddressList, rather than giving up what it holds as an address.
+	const outside = unquoted.replace(/\([^)]*(?:\)|$)/g, hide);
+	const angled = outside.match(/<([^<>\s]+@[^<>\s]+)>\s*$/);
+	// A group ends with a semicolon that belongs to the group, not to the
+	// last address in it.
+	const bare = outside.match(/([^\s<>@",;]+@[^\s<>@",;]+)/);
+	return {
+		address: (angled?.[1] ?? bare?.[1])?.toLowerCase(),
+		angled: angled !== null,
+		outside,
+		hidden,
+		// Comments nest, which no pattern can follow, so a parenthesis still
+		// there once the plain comments are gone was nested, left open, or
+		// closed twice.
+		unbalanced: unquoted.includes('"') || /[()]/.test(unquoted.replace(/\([^()]*\)/g, "")),
+	};
+}
+
+// The obsolete syntax receivers still parse lets the pieces of a bare address
+// sit apart: "boss@company.com(c).evil.example" and "boss@company.com
+// .evil.example" join into boss@company.com.evil.example, and
+// '"spy".alice@gmail.com' into spy.alice@gmail.com. A bare address counts only
+// when nothing but comments, a group's name and its closing semicolon sits
+// beside it, and it is a plain dot-atom.
+function standsAlone(read: AddressEntry): boolean {
+	const rest = read.outside
+		.replace(/^[^@:<>"]*:/, "")
+		.replace(/;\s*$/, "")
+		.trim()
+		.toLowerCase();
+	return (
+		rest === read.address &&
+		!read.hidden.some((text) => text.startsWith('"')) &&
+		/^[^.@\s]+(?:\.[^.@\s]+)*@[^.@\s]+(?:\.[^.@\s]+)*$/.test(rest)
+	);
+}
+
+// A recipient check compares a list against what Gmail will deliver to, so an
+// entry that two readers could take for different mailboxes has to be refused
+// rather than read one way. A name or comment holding "<" or "@" can pass for
+// an address; a quote or parenthesis left open leaves where a name ends to the
+// reader; an entry with a second address or angle bracket, or an address this
+// reader cannot find, is not counted the way Gmail counts it; and a bare
+// address with more joined to it is another mailbox. An empty group names
+// nobody.
+function readsMoreThanOneWay(read: AddressEntry): boolean {
+	const ats = read.outside.split("@").length - 1;
+	const brackets = read.outside.replace(/[^<>]/g, "").length;
+	return (
+		read.hidden.some((text) => /[<@]/.test(text)) ||
+		read.unbalanced ||
+		brackets !== (read.angled ? 2 : 0) ||
+		(read.address ? ats !== 1 : !/^[^@]*:\s*;?\s*$/.test(read.outside)) ||
+		(read.address !== undefined && !read.angled && !standsAlone(read))
+	);
+}
+
 // Extracts bare addresses from a header value, tolerating display names with
-// commas inside quotes ("Doe, John" <j@example.com>).
-export function parseAddresses(header: string | undefined): string[] {
+// commas inside quotes ("Doe, John" <j@example.com>). Strict reading is for the
+// recipient checks, which refuse an entry rather than guess at it.
+export function parseAddresses(
+	header: string | undefined,
+	{ strict = false }: { strict?: boolean } = {},
+): string[] {
 	if (!header) return [];
 	const out: string[] = [];
 	for (const entry of splitAddressList(header)) {
-		const angled = entry.match(/<([^<>\s]+@[^<>\s]+)>/);
-		if (angled) {
-			out.push((angled[1] ?? "").toLowerCase());
-			continue;
+		const read = readAddressEntry(entry);
+		if (strict && readsMoreThanOneWay(read)) {
+			throw new Error(
+				`the recipient ${entry} could be read as more than one address, so who it reaches cannot be checked here; send it from Gmail instead`,
+			);
 		}
-		// No angle-addr: drop comments and quoted text, then take the address token.
-		const bare = entry
-			.replace(/\([^)]*\)/g, " ")
-			.replace(/"(?:[^"\\]|\\.)*"/g, " ")
-			// A group ends with a semicolon that belongs to the group, not to the
-			// last address in it.
-			.match(/([^\s<>@",;]+@[^\s<>@",;]+)/);
-		if (bare?.[1]) out.push(bare[1].toLowerCase());
+		if (read.address) out.push(read.address);
 	}
 	return [...new Set(out)];
 }
@@ -1066,8 +1146,14 @@ export function summarizeMessage(m: GmailMessage) {
 		labelIds: m.labelIds,
 		snippet: m.snippet,
 		from: headerValue(m, "From"),
+		// A reply goes here instead of to From, so whoever decides to answer
+		// needs to see it as much as the sender.
+		replyTo: headerValue(m, "Reply-To"),
 		to: headerValue(m, "To"),
 		cc: headerValue(m, "Cc"),
+		// Only the sender's own copy keeps a Bcc, so this names someone only on
+		// mail this account sent or drafted.
+		bcc: headerValue(m, "Bcc"),
 		date: headerValue(m, "Date"),
 		subject: headerValue(m, "Subject"),
 	};

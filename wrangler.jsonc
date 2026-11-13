@@ -33,7 +33,22 @@
 	"vars": {
 		// How many distinct Google accounts may ever complete sign-in. Raise it
 		// for a shared deployment; Google caps unverified apps at 100 users.
-		"MAX_ACCOUNTS": "25"
+		"MAX_ACCOUNTS": "1",
+		// Each Google account is pinned to the first OAuth client that completes
+		// a sign-in for it, and any other client is then refused for that account.
+		// This stops a link someone sends from connecting their own client to your
+		// mailbox once you have connected yours. Setting ALLOWED_CLIENT_IDS takes
+		// over from it. Reset an account's pin with
+		// `wrangler kv key delete "pin:<address>" --namespace-id <id> --remote`.
+		"PIN_FIRST_CLIENT": "true"
+		// Optional: the exact redirect URIs a client may sign in with, comma-
+		// separated. Unset, only Claude's two callbacks are accepted:
+		// https://claude.ai/api/mcp/auth_callback and
+		// https://claude.com/api/mcp/auth_callback. Each entry added is one more
+		// place an authorization code can be sent, and a localhost entry hands
+		// codes to whatever listens on that port of the signing-in machine. A list
+		// that is set replaces the default, so name Claude's callbacks in it too.
+		// "ALLOWED_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback"
 	},
 	"unsafe": {
 		"bindings": [
@@ -64,8 +79,18 @@
 	"dev": {
 		"port": 8788
 	},
+	// Invocation logs would keep every tool call's arguments (the agents SDK
+	// forwards them to the session as the cf-mcp-message header), the account
+	// address and capability URLs for days. Only console output is kept.
 	"observability": {
-		"enabled": true
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"invocation_logs": false
+		},
+		"traces": {
+			"enabled": false
+		}
 	}
 	// A deployment answers on workers.dev unless it is given a custom domain,
 	// which `bun run setup` writes into wrangler.local.jsonc as a route. Google

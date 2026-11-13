@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="560" viewBox="0 0 1600 560" role="img" aria-label="gmail-mcp for Claude: two Gmail accounts, one Claude">
+<defs><clipPath id="c"><rect x="2" y="2" width="1596" height="556" rx="44"/></clipPath></defs>
+<g clip-path="url(#c)">
+<rect width="1600" height="560" fill="#FFFFFF"/>
+<rect width="1600" height="200" fill="#B9C1FF"/>
+</g>
+<rect x="2" y="2" width="1596" height="556" rx="44" fill="none" stroke="#E6E4EF" stroke-width="3"/>
+<text x="84" y="124" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="56" font-weight="800" letter-spacing="-1" fill="#38188F">gmail-mcp</text>
+<text x="1516" y="114" text-anchor="end" font-family="'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace" font-size="30" font-weight="700" letter-spacing="7" fill="#38188F">FOR CLAUDE</text>
+<text x="84" y="318" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="72" font-weight="800" letter-spacing="-1.5" fill="#1C1A26">Two Gmail accounts. One Claude.</text>
+<text x="84" y="398" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="34" fill="#4E4B60">Your work inbox and your personal inbox, connected at the same time.</text>
+<text x="84" y="446" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="34" fill="#4E4B60">No more disconnecting and reconnecting every time you switch.</text>
+</svg>

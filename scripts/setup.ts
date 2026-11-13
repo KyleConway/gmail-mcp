@@ -1,6 +1,13 @@
 #!/usr/bin/env bun
 // Guided deployment: domain, KV namespace, secrets, deploy. Every step is
 // skippable, so re-running it to rotate one secret is safe.
+//
+// The deployment's own domain and KV id go into wrangler.local.jsonc, which
+// wrangler reads in place of wrangler.jsonc once this has run. That file is a
+// copy of the template, so an edit to wrangler.jsonc made afterwards would
+// never be deployed. `bun run setup --sync` rebuilds the copy from the current
+// template, keeping only the domain and KV id, and `bun run deploy` and
+// `bun run dev` run it first for that reason.
 
 import { $ } from "bun";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -54,6 +61,31 @@ const local = existsSync(LOCAL) ? (parseJsonc(readFileSync(LOCAL, "utf8")) as Re
 const configuredDomain: string | undefined = local?.routes?.[0]?.pattern;
 const configuredKv: string | undefined = local?.kv_namespaces?.[0]?.id;
 
+// Everything but the two values setup owns comes from the template as it is
+// now, so nothing an earlier run copied can go stale.
+function writeLocalConfig(kvId: string | undefined, domain: string | undefined) {
+	const config = parseJsonc(template) as Record<string, any>;
+	if (kvId) config.kv_namespaces[0].id = kvId;
+	if (domain) config.routes = [{ pattern: domain, custom_domain: true }];
+	writeFileSync(
+		LOCAL,
+		[
+			"// Generated from wrangler.jsonc by `bun run setup`; edit that file instead.",
+			"// Only this deployment's domain and KV namespace id are added here, so",
+			`// that ${TEMPLATE} stays free of both and a clone deploys onto any account.`,
+			`${JSON.stringify(config, null, "\t")}\n`,
+		].join("\n"),
+	);
+	mkdirSync(dirname(REDIRECT), { recursive: true });
+	writeFileSync(REDIRECT, `${JSON.stringify({ configPath: `../../${LOCAL}` }, null, "\t")}\n`);
+}
+
+if (process.argv.includes("--sync")) {
+	// A clone that never ran setup deploys wrangler.jsonc as it is.
+	if (local) writeLocalConfig(configuredKv, configuredDomain);
+	process.exit(0);
+}
+
 console.log("\n  gmail-mcp setup\n");
 console.log(`  template    ${TEMPLATE}`);
 console.log(`  deployment  ${LOCAL}${local ? "" : " (not written yet)"}`);
@@ -86,20 +118,7 @@ if (listed && !listed.some((ns) => ns.id === kvId)) {
 	}
 }
 
-const config = parseJsonc(template) as Record<string, any>;
-if (kvId) config.kv_namespaces[0].id = kvId;
-if (domain) config.routes = [{ pattern: domain, custom_domain: true }];
-
-writeFileSync(
-	LOCAL,
-	[
-		"// This deployment's own domain and KV namespace, written by `bun run setup`.",
-		`// ${TEMPLATE} stays free of both so that a clone deploys onto any account.`,
-		`${JSON.stringify(config, null, "\t")}\n`,
-	].join("\n"),
-);
-mkdirSync(dirname(REDIRECT), { recursive: true });
-writeFileSync(REDIRECT, `${JSON.stringify({ configPath: `../../${LOCAL}` }, null, "\t")}\n`);
+writeLocalConfig(kvId, domain);
 console.log(`\n  Wrote ${LOCAL}; deploy and dev read it from now on.\n`);
 
 const secrets = [

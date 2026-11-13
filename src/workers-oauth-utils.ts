@@ -901,7 +901,10 @@ async function getApprovedClientsFromCookie(
 	}
 }
 
-async function signData(data: string, secret: string): Promise<string> {
+// The HMAC behind the approval cookie and the dialog's state. The file
+// addresses a session mints are signed with it too, under a prefix that
+// neither of those payloads can begin with.
+export async function signData(data: string, secret: string): Promise<string> {
 	const key = await importKey(secret);
 	const enc = new TextEncoder();
 	const signatureBuffer = await crypto.subtle.sign("HMAC", key, enc.encode(data));
@@ -910,7 +913,7 @@ async function signData(data: string, secret: string): Promise<string> {
 		.join("");
 }
 
-async function verifySignature(
+export async function verifySignature(
 	signatureHex: string,
 	data: string,
 	secret: string,

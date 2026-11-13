@@ -3,6 +3,7 @@ import {
 	exchangeGoogleCode,
 	fetchGoogleUserInfo,
 	getGoogleAuthorizeUrl,
+	rateLimitKey,
 	refreshGoogleToken,
 } from "../src/utils";
 
@@ -179,5 +180,51 @@ describe("fetchGoogleUserInfo", () => {
 	test("throws when email is absent", async () => {
 		mockFetch(() => Response.json({ verified_email: true }));
 		expect(fetchGoogleUserInfo("at")).rejects.toThrow("no email");
+	});
+});
+
+describe("rateLimitKey", () => {
+	const from = (address?: string) =>
+		rateLimitKey(
+			new Request(
+				"https://mcp.example.com/authorize",
+				address ? { headers: { "CF-Connecting-IP": address } } : undefined,
+			),
+		);
+
+	test("keys an IPv4 caller by its address", () => {
+		expect(from("203.0.113.9")).toBe("203.0.113.9");
+	});
+
+	// Every address in a /64 belongs to the same subscriber, so stepping through
+	// them must not buy a fresh allowance each time.
+	test("keys an IPv6 caller by its /64", () => {
+		expect(from("2001:db8:aaaa:bbbb:1:2:3:4")).toBe("2001:db8:aaaa:bbbb::/64");
+		expect(from("2001:db8:aaaa:bbbb::1")).toBe("2001:db8:aaaa:bbbb::/64");
+		expect(from("2001:db8:aaaa:bbbb:ffff:ffff:ffff:ffff")).toBe("2001:db8:aaaa:bbbb::/64");
+	});
+
+	test("expands a compressed address before taking its prefix", () => {
+		expect(from("2001:db8::1")).toBe("2001:db8:0:0::/64");
+		expect(from("2001:db8::")).toBe("2001:db8:0:0::/64");
+		// The groups after :: can reach back into the prefix.
+		expect(from("2001:db8::1:2:3:4:5")).toBe("2001:db8:0:1::/64");
+		expect(from("::1")).toBe("0:0:0:0::/64");
+	});
+
+	test("writes one prefix the same way however it was spelled", () => {
+		expect(from("2001:0DB8:00aa:0000::1")).toBe("2001:db8:aa:0::/64");
+	});
+
+	// Collapsed to its /64, every IPv4-mapped caller would share one bucket.
+	test("keys an address it cannot read as plain IPv6 as it came", () => {
+		expect(from("::ffff:203.0.113.9")).toBe("::ffff:203.0.113.9");
+		expect(from("2001:db8::1::2")).toBe("2001:db8::1::2");
+		expect(from("1:2:3:4:5:6:7:8:9")).toBe("1:2:3:4:5:6:7:8:9");
+		expect(from("fe80::1%eth0")).toBe("fe80::1%eth0");
+	});
+
+	test("keys a request that carries no address as unknown", () => {
+		expect(from()).toBe("unknown");
 	});
 });

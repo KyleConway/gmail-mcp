@@ -50,6 +50,124 @@ export function parseLimit(raw: string | undefined, fallback: number): number {
 	return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+// Claude's apps finish every sign-in on one of these, and nothing else is
+// meant to sign in here. The provider only checks a redirect against what the
+// client registered for itself, and open registration lets anyone choose
+// that, so the comparison is with the whole string: a look-alike host, an
+// app scheme or a userinfo prefix all fail it.
+const CLAUDE_CALLBACKS = new Set([
+	"https://claude.ai/api/mcp/auth_callback",
+	"https://claude.com/api/mcp/auth_callback",
+]);
+
+export function isClaudeRedirect(uri: string): boolean {
+	return CLAUDE_CALLBACKS.has(uri);
+}
+
+// ALLOWED_REDIRECT_URIS replaces Claude's two callbacks with the operator's own
+// list, comma-separated, for a deployment that serves some other MCP client.
+// Each entry is compared with the whole redirect, character for character:
+// a pattern or a prefix would let a look-alike path or host through, which is
+// exactly what this check exists to stop. An unset or empty setting keeps the
+// Claude-only default, so a typo that empties the list cannot open sign-in to
+// every redirect. Every entry added is one more place an authorization code
+// can be sent, and a localhost entry hands codes to whatever process on the
+// signing-in machine listens on that port.
+export function allowedRedirects(raw: string | undefined): ReadonlySet<string> {
+	const listed = (raw ?? "")
+		.split(",")
+		.map((uri) => uri.trim())
+		.filter(Boolean);
+	return listed.length > 0 ? new Set(listed) : CLAUDE_CALLBACKS;
+}
+
+export function isAllowedRedirect(uri: string, raw: string | undefined): boolean {
+	return allowedRedirects(raw).has(uri);
+}
+
+// The provider refuses only a handful of dangerous schemes in a registered
+// redirect, so a client naming any other host or an app scheme would register
+// and stay in KV for the decade a registration lasts. /authorize refuses such a
+// redirect anyway, so the client could never sign in, and refusing it here
+// keeps it out of KV. One allowed callback among several is enough, so a URI
+// Claude adds to its list later cannot lock the owner out.
+export function registrationRefusal(
+	redirectUris: unknown,
+	raw: string | undefined,
+): { description: string } | undefined {
+	if (
+		Array.isArray(redirectUris) &&
+		redirectUris.some((uri) => typeof uri === "string" && isAllowedRedirect(uri, raw))
+	) {
+		return undefined;
+	}
+	return {
+		description: raw?.trim()
+			? "This server only registers clients whose callback is in ALLOWED_REDIRECT_URIS, and none was listed."
+			: "This server only registers Claude, and no Claude callback was listed.",
+	};
+}
+
+// Registration stays open because Claude registers a client of its own on each
+// fresh connection, and a client registered from someone else's Claude account
+// returns to the same callback as the owner's. Once the owner's connector has
+// registered, ALLOWED_CLIENT_IDS can name its id (comma-separated for more than
+// one), and any other client is refused before it reaches a dialog someone
+// could be talked into approving. Unlike ALLOWED_EMAILS, an empty setting pins
+// nothing.
+export function isClientAllowed(clientId: string, allowList: string | undefined): boolean {
+	const ids = (allowList ?? "")
+		.split(",")
+		.map((id) => id.trim())
+		.filter(Boolean);
+	return ids.length === 0 || ids.includes(clientId);
+}
+
+// Without ALLOWED_CLIENT_IDS, anyone holding the URL can register a client and
+// send the owner a link to approve it. Pinning each account to the first client
+// that completes a sign-in for it closes that once the owner has connected,
+// with nothing to copy into a secret. It is on unless PIN_FIRST_CLIENT says
+// otherwise, so a deployment that never set it is pinned rather than open.
+// An explicit ALLOWED_CLIENT_IDS is the operator choosing for themselves, and
+// it takes over entirely.
+export function isAutoPinEnabled(
+	pinFirstClient: string | undefined,
+	allowedClientIds: string | undefined,
+): boolean {
+	const listed = (allowedClientIds ?? "").split(",").some((id) => id.trim() !== "");
+	if (listed) return false;
+	const flag = (pinFirstClient ?? "").trim().toLowerCase();
+	return !["false", "0", "no", "off"].includes(flag);
+}
+
+// One key per account, apart from the account: markers the cap counts. The
+// address is lowercased for the same reason the marker's is: Google may report
+// one mailbox in either case.
+export function pinKey(email: string): string {
+	return `pin:${email.trim().toLowerCase()}`;
+}
+
+// Limits are counted per caller address, but one IPv6 subscriber is routinely
+// handed a whole /64, and keyed on the full address that caller would get a
+// fresh allowance for every address in it. The first four groups are what
+// identify it. Anything that does not read as plain IPv6 is keyed as it came,
+// which is what an IPv4 address needs, and keeps an IPv4-mapped address from
+// sharing one bucket with every other.
+export function rateLimitKey(request: Request): string {
+	const address = request.headers.get("cf-connecting-ip") ?? "unknown";
+	const halves = address.toLowerCase().split("::");
+	if (!address.includes(":") || halves.length > 2) return address;
+	const head = halves[0] ? halves[0].split(":") : [];
+	const tail = halves[1] ? halves[1].split(":") : [];
+	const gap = halves.length === 2 ? Math.max(8 - head.length - tail.length, 0) : 0;
+	const groups = [...head, ...Array.from({ length: gap }, () => "0"), ...tail];
+	if (groups.length !== 8 || !groups.every((group) => /^[0-9a-f]{1,4}$/.test(group))) {
+		return address;
+	}
+	const prefix = groups.slice(0, 4).map((group) => Number.parseInt(group, 16).toString(16));
+	return `${prefix.join(":")}::/64`;
+}
+
 export function getGoogleAuthorizeUrl({
 	client_id,
 	redirect_uri,

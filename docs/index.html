@@ -6,49 +6,42 @@
 <title>gmail-mcp — setup</title>
 <style>
   :root {
-    color-scheme: light dark;
-    --bg: #fbfaf9;
-    --panel: #ffffff;
-    --ink: #16181d;
-    --muted: #5b6270;
-    --line: #e6e3df;
-    --warm: #e8590c;
-    --cool: #5b4bcf;
-    --ok: #197d4a;
-    --code-bg: #f4f2ef;
-    --shadow: 0 1px 2px rgba(20,20,30,.05), 0 8px 24px rgba(20,20,30,.06);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0d1117;
-      --panel: #151a22;
-      --ink: #e8eaee;
-      --muted: #9aa3b2;
-      --line: #262d38;
-      --warm: #f6821f;
-      --cool: #9d8cff;
-      --ok: #4ade80;
-      --code-bg: #0b0f15;
-      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 28px rgba(0,0,0,.35);
-    }
+    color-scheme: light;
+    --bg: #F4F3FF;
+    --panel: #FFFFFF;
+    --ink: #1C1A26;
+    --muted: #4E4B60;
+    --faint: #7A778C;
+    --line: #E6E4EF;
+    --peri: #B9C1FF;
+    --night: #38188F;
+    --warm: #38188F;
+    --cool: #38188F;
+    --ok: #38188F;
+    --code-bg: #EFF0FF;
+    --shadow: 0 1px 2px rgba(28,26,38,.04), 0 10px 30px rgba(56,24,143,.06);
+    --mono: 'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--ink);
-    font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
   .wrap { max-width: 820px; margin: 0 auto; padding: 0 24px 96px; }
-  header { padding: 72px 0 40px; text-align: center; }
-  h1 { font-size: 2.6rem; margin: 0 0 .3em; letter-spacing: -.03em; }
-  h1 .dash { color: var(--warm); }
-  .tagline { color: var(--muted); font-size: 1.08rem; margin: 0 auto; max-width: 34em; }
-  .pills { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 24px; }
+  header { margin: 40px 0 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 22px; overflow: hidden; box-shadow: var(--shadow); }
+  .band { background: var(--peri); padding: 26px 32px; display: flex; align-items: center; justify-content: space-between; gap: 16px; color: var(--night); }
+  .wordmark { font-size: 1.7rem; font-weight: 800; letter-spacing: -.02em; color: var(--night); }
+  .eyebrow { font: 700 .78rem/1 var(--mono); letter-spacing: .28em; text-transform: uppercase; color: var(--night); }
+  .intro { padding: 30px 32px 32px; }
+  h1 { font-size: 2.4rem; line-height: 1.1; margin: 0 0 .4em; letter-spacing: -.03em; font-weight: 800; }
+  .tagline { color: var(--muted); font-size: 1.08rem; margin: 0; max-width: 34em; }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
   .pill {
-    font-size: .78rem; letter-spacing: .02em; padding: 5px 11px; border-radius: 999px;
-    border: 1px solid var(--line); color: var(--muted); background: var(--panel);
+    font: 700 .7rem/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; padding: 7px 11px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--night); background: var(--code-bg);
   }
   h2 {
     font-size: 1.32rem; margin: 56px 0 6px; letter-spacing: -.01em;
@@ -57,7 +50,7 @@
   h2 .n {
     flex: none; width: 1.7em; height: 1.7em; border-radius: 50%;
     display: grid; place-items: center; font-size: .72em;
-    background: linear-gradient(135deg, var(--warm), #c2410c); color: #fff; font-weight: 700;
+    background: var(--peri); color: var(--night); font-weight: 800;
   }
   h2 + p { color: var(--muted); margin-top: 0; }
   .card {
@@ -75,7 +68,7 @@
   ol.steps li { margin: .5em 0; }
   table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: .95rem; }
   th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  th { font: 700 .7rem/1.4 var(--mono); text-transform: uppercase; letter-spacing: .16em; color: var(--night); }
   .note {
     border-left: 3px solid var(--warm); background: color-mix(in oklab, var(--warm) 7%, transparent);
     padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0; font-size: .95rem;
@@ -100,9 +93,10 @@
     border: 1px solid var(--line); background: var(--panel); color: var(--muted);
   }
   .copy button:hover { color: var(--ink); border-color: var(--muted); }
-  footer { margin-top: 72px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; text-align: center; }
+  footer { margin-top: 72px; background: var(--night); color: #fff; border-radius: 22px; padding: 28px 32px; font-size: .95rem; }
+  footer p { margin: .3em 0; color: rgba(255,255,255,.85); }
   a { color: var(--warm); text-underline-offset: 2px; }
-  footer a { color: var(--muted); }
+  footer a { color: var(--peri); }
   .checkline { display: flex; gap: .6em; align-items: flex-start; margin: .45em 0; }
   .checkline span:first-child { color: var(--ok); font-weight: 700; }
 </style>
@@ -111,26 +105,29 @@
 <div class="wrap">
 
 <header>
-  <h1>gmail<span class="dash">-</span>mcp</h1>
-  <p class="tagline">Your Gmail accounts, served to any MCP client, from your own Cloudflare Worker. Roughly ten minutes to deploy.</p>
+  <div class="band"><span class="wordmark">gmail-mcp</span><span class="eyebrow">For Claude</span></div>
+  <div class="intro">
+  <h1>Your second inbox, connected for good.</h1>
+  <p class="tagline">This is your own Gmail connector for Claude, running on your Cloudflare account. Here's how to finish setting it up. It takes about 20 minutes, and most of that is Google Cloud.</p>
   <div class="pills">
     <span class="pill">27 tools</span>
     <span class="pill">OAuth 2.1 + PKCE</span>
-    <span class="pill">multi-account</span>
+    <span class="pill">Claude only by default</span>
     <span class="pill">scope gmail.modify</span>
     <span class="pill">MIT</span>
+  </div>
   </div>
 </header>
 
 <div class="flow">
-  <div class="box"><b>MCP client</b>Claude Code · claude.ai · mobile</div>
+  <div class="box"><b>Claude</b>claude.ai · desktop · mobile · Claude Code</div>
   <div class="arrow">→</div>
   <div class="box"><b>your Worker</b>OAuth server + agent</div>
   <div class="arrow">→</div>
   <div class="box"><b>Gmail API</b>one mailbox per grant</div>
 </div>
 
-<p>Every <em>connection</em> performs its own Google sign-in, so two mailboxes can be connected to one deployment at the same time — each permanently bound to the account chosen at its consent screen. Your refresh tokens stay in your own Cloudflare account.</p>
+<p>Every <em>connection</em> performs its own Google sign-in and is bound to the account chosen at its consent screen, and that account is then pinned to the first connector that signed it in. Your refresh tokens stay in your own Cloudflare account. The full guide, with every Google Cloud screen, is <a href="https://github.com/KyleConway/gmail-mcp/blob/main/docs/SETUP.md">docs/SETUP.md</a>.</p>
 
 <h2><span class="n">1</span> Google Cloud</h2>
 <p>Create a project and switch the Gmail API on.</p>
@@ -144,27 +141,31 @@ gcloud services enable gmail.googleapis.com</pre>
 <button data-copy="c1">copy</button>
 </div>
 
-<p>The consent screen and the OAuth client have no API, so these two happen in the <a href="https://console.cloud.google.com/">Cloud console</a>:</p>
+<p>The consent screen and the OAuth client have no API, so these happen in the <a href="https://console.cloud.google.com/">Cloud console</a>:</p>
 <ol class="steps">
-  <li><a href="https://console.cloud.google.com/auth/overview"><b>OAuth consent screen</b></a> → <i>External</i> → app name and your email, then under <b>Audience</b> press <b>Publish app</b>. Left in Testing, Google expires every refresh token after 7 days and each connection dies with its token. Published, sign-in shows an unverified-app warning and up to 100 accounts can connect.</li>
-  <li><a href="https://console.cloud.google.com/apis/credentials"><b>Credentials</b></a> <b>→ Create credentials → OAuth client ID</b> → <i>Web application</i>, with one authorized redirect URI:
+  <li><a href="https://console.cloud.google.com/auth/overview"><b>Google Auth Platform → Get started</b></a>: app name, your email, audience <i>External</i>.</li>
+  <li><a href="https://console.cloud.google.com/auth/branding"><b>Branding</b></a>: fill in the home page, privacy policy and terms of service links (any pages you control; <code>https://&lt;your-host&gt;/</code> works as the home page), list each link's domain under <b>Authorized domains</b>, and add a developer contact. Do not upload a logo: it makes Google require verification.</li>
+  <li><a href="https://console.cloud.google.com/auth/audience"><b>Audience</b></a> → <b>Publish app</b>. Left in Testing, Google expires every refresh token after 7 days. Published, sign-in shows an unverified-app warning, which is expected.</li>
+  <li><a href="https://console.cloud.google.com/auth/clients"><b>Clients</b></a> → <b>Create client</b> → <i>Web application</i>, with one authorized redirect URI:
     <pre id="redirect">https://&lt;your-host&gt;/callback</pre>
-    Keep the client ID and secret for the next step.</li>
+    Select <b>Download JSON</b> straight away: the client secret is shown only once.</li>
 </ol>
 
-<div class="note">Adding <code>http://localhost:8788/callback</code> as a second redirect URI now saves a trip back if you ever run <code>bun run dev</code>.</div>
-
 <h2><span class="n">2</span> Cloudflare</h2>
-<p>Clone and let the setup script do the rest.</p>
+<p>Deploy, then set the secrets. Each <code>secret put</code> prompts for its value: type the client secret yourself, and never paste it into a chat.</p>
 
 <div class="card copy">
-<pre id="c2">git clone https://github.com/mkpoli/gmail-mcp &amp;&amp; cd gmail-mcp
+<pre id="c2">git clone https://github.com/KyleConway/gmail-mcp &amp;&amp; cd gmail-mcp
 bun install
-bun run setup</pre>
+bun run deploy
+./node_modules/.bin/wrangler secret put GOOGLE_CLIENT_ID
+./node_modules/.bin/wrangler secret put GOOGLE_CLIENT_SECRET
+openssl rand -hex 32 | ./node_modules/.bin/wrangler secret put COOKIE_ENCRYPTION_KEY
+./node_modules/.bin/wrangler secret put ALLOWED_EMAILS</pre>
 <button data-copy="c2">copy</button>
 </div>
 
-<p><code>bun run setup</code> asks which domain to answer on, creates or reuses the KV namespace, prompts for each secret, generates the cookie key, and deploys. It is safe to re-run — every step can be skipped.</p>
+<p>Until the secrets are set, the Worker refuses every sign-in.</p>
 
 <h2><span class="n">3</span> Decide who may sign in</h2>
 <p><code>ALLOWED_EMAILS</code> is checked against the address Google reports as verified, after consent and before any grant exists.</p>
@@ -179,18 +180,25 @@ bun run setup</pre>
 
 <div class="note cool">A grant only ever reaches the mailbox that authenticated it, so widening this list never widens access to accounts already connected. What <code>*</code> hands strangers is the use of your deployment, and your Google client's quota, for their own mail.</div>
 
-<h2><span class="n">4</span> Connect</h2>
-<p>No client ID or secret on the client side — MCP clients register themselves.</p>
+<h2><span class="n">4</span> Connect in claude.ai</h2>
+<p>In claude.ai, go to <b>Settings → Connectors → Add custom connector</b>, name it (for example <i>Gmail – Personal</i>), and use this URL. Leave the OAuth client ID and secret fields empty: Claude registers itself.</p>
 
 <div class="card copy">
-<pre id="c3">claude mcp add --transport http gmail-personal https://&lt;your-host&gt;/mcp
-claude mcp add --transport http gmail-work     https://&lt;your-host&gt;/mcp/work</pre>
+<pre id="c3">https://&lt;your-host&gt;/mcp/personal</pre>
 <button data-copy="c3">copy</button>
 </div>
 
-<p>Run <code>/mcp</code> in Claude Code to authenticate each one, signing in with the matching Google account. In claude.ai: <b>Settings → Connectors → Add custom connector</b>, paste the URL, leave the credential fields empty.</p>
+<ol class="steps">
+  <li>Select <b>Connect</b>, then <b>Approve</b> on this server's dialog.</li>
+  <li>Choose your Google account. On <i>Google hasn't verified this app</i>, select <b>Advanced → Go to …</b>.</li>
+  <li>Leave every permission ticked and continue.</li>
+  <li>Set each tool's permission in the connector's settings: allow reading, require approval for sending.</li>
+  <li>Ask Claude to run the connector's <code>whoami</code> tool. It should answer with your address.</li>
+</ol>
 
-<div class="note">Any single-segment label works — <code>/mcp/work</code>, <code>/mcp/family</code>. It exists so clients that refuse two servers sharing a URL can still hold several mailboxes.</div>
+<div class="note">The connector syncs to Claude Code and the Claude apps. <code>claude mcp add</code>, the MCP Inspector and localhost sign-ins are refused by design: only Claude's own callbacks may sign in unless <code>ALLOWED_REDIRECT_URIS</code> says otherwise. Any single-segment label works after <code>/mcp/</code>, so a second mailbox can use <code>/mcp/family</code>.</div>
+
+<div class="note cool">The first connector to finish signing in is pinned to that account. If you remove and re-add the connector, sign-in returns a 403 that explains how to reset the pin. If you did not start the sign-in yourself from Claude's Connect button, change nothing.</div>
 
 <h2><span class="n">5</span> What you get</h2>
 <div class="checkline"><span>✓</span><span><b>Read</b> — search with Gmail operators, read messages and threads, download attachments</span></div>
@@ -200,7 +208,7 @@ claude mcp add --transport http gmail-work     https://&lt;your-host&gt;/mcp/wor
 <p>Japanese, Chinese, emoji, and right-to-left text survive the round trip: subjects and filenames are RFC 2047 encoded, bodies carry their declared charset.</p>
 
 <footer>
-  <a href="https://github.com/mkpoli/gmail-mcp">github.com/mkpoli/gmail-mcp</a> · MIT
+  <p><a href="https://github.com/KyleConway/gmail-mcp">github.com/KyleConway/gmail-mcp</a> · fork of <a href="https://github.com/mkpoli/gmail-mcp">mkpoli/gmail-mcp</a> · MIT</p>
 </footer>
 
 </div>

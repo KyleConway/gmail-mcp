@@ -1,18 +1,21 @@
 {
 	"name": "gmail-mcp",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"private": true,
 	"type": "module",
-	"description": "Multi-account Gmail on a Cloudflare Worker you deploy yourself: search and read mail, send, reply-all with quoted history, forward, attachments, drafts, labels, and threads, over MCP",
+	"description": "A second (or third) Gmail account in Claude: a hardened, self-hosted Gmail MCP server on a Cloudflare Worker, forked from mkpoli/gmail-mcp. Search and read mail, send, reply-all with quoted history, forward, attachments, drafts, labels, and threads",
 	"license": "MIT",
-	"author": "mkpoli",
-	"homepage": "https://github.com/mkpoli/gmail-mcp#readme",
+	"author": "Kyle Conway (https://github.com/KyleConway)",
+	"contributors": [
+		"mkpoli (https://github.com/mkpoli), original author"
+	],
+	"homepage": "https://github.com/KyleConway/gmail-mcp#readme",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/mkpoli/gmail-mcp.git"
+		"url": "git+https://github.com/KyleConway/gmail-mcp.git"
 	},
 	"bugs": {
-		"url": "https://github.com/mkpoli/gmail-mcp/issues"
+		"url": "https://github.com/KyleConway/gmail-mcp/issues"
 	},
 	"keywords": [
 		"mcp",
@@ -24,16 +27,14 @@
 		"cloudflare-workers",
 		"oauth"
 	],
-	"mcpName": "io.github.mkpoli/gmail-mcp",
 	"scripts": {
-		"dev": "wrangler dev",
-		"deploy": "wrangler deploy",
+		"dev": "bun run scripts/setup.ts --sync && wrangler dev",
+		"deploy": "bun run scripts/setup.ts --sync && wrangler deploy",
 		"check": "biome check src test && tsrs --noEmit",
 		"fix": "biome check --write src test",
 		"test": "bun test",
 		"types": "wrangler types",
 		"setup": "bun run scripts/setup.ts",
-		"assets": "bun run scripts/render-assets.ts",
 		"check:render": "python3 scripts/check-render.py",
 		"check:counts": "python3 scripts/check-counts.py"
 	},
@@ -46,7 +47,7 @@
 				"description": "Client secret of that same Google OAuth client."
 			},
 			"COOKIE_ENCRYPTION_KEY": {
-				"description": "Random 32 bytes as hex, from `openssl rand -hex 32`. It signs the approval cookie the sign-in flow sets."
+				"description": "Random 32 bytes as hex, from `openssl rand -hex 32`. It signs the approval forms and cookies of the sign-in flow, and attachment links."
 			},
 			"ALLOWED_EMAILS": {
 				"description": "Who may sign in, checked against the address Google reports as verified: a comma-separated list, *@your-domain.com, or * for any Google account. Empty means nobody."

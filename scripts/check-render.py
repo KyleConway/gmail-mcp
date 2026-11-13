@@ -4,7 +4,7 @@ import re, subprocess, sys
 from html import unescape
 
 status = 0
-for f in ["README.md", "README.ja.md", "README.zh.md"]:
+for f in ["README.md", "docs/SETUP.md", "SECURITY.md"]:
     html = subprocess.run(
         ["gh", "api", "--method", "POST", "/markdown", "-f", "mode=gfm", f"--field", f"text=@{f}"],
         capture_output=True, text=True, check=True).stdout

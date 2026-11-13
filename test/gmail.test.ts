@@ -684,6 +684,31 @@ describe("reply helpers", () => {
 		]);
 	});
 
+	// A display name or a comment is text whoever wrote the header chose, and
+	// a mail server delivers to the address after it. Read from the raw entry,
+	// the first <…@…> anywhere decided who a reply went to.
+	test("parseAddresses takes the address, not one written inside a name or comment", () => {
+		expect(parseAddresses('"Pat Client <spy@evil.example>" <pat@client.example>')).toEqual([
+			"pat@client.example",
+		]);
+		expect(parseAddresses("john@company.example (<spy@evil.example>)")).toEqual([
+			"john@company.example",
+		]);
+		expect(parseAddresses(`"'<spy@evil.example>' via Team" <team@googlegroups.com>`)).toEqual([
+			"team@googlegroups.com",
+		]);
+		expect(parseAddresses('"<alice@x.example>" <spy@evil.example>')).toEqual(["spy@evil.example"]);
+		// A parenthesis inside a quoted name opens no comment.
+		expect(parseAddresses('"Smith (Sales" <s@example.com>')).toEqual(["s@example.com"]);
+	});
+
+	// A comment nothing closes is still a comment, as splitAddressList reads it.
+	test("parseAddresses does not take an address from a comment left open", () => {
+		expect(parseAddresses("john@company.example (<spy@evil.example>")).toEqual([
+			"john@company.example",
+		]);
+	});
+
 	test("forwardSubject prefixes once", () => {
 		expect(forwardSubject("Hello")).toBe("Fwd: Hello");
 		expect(forwardSubject("Fwd: Hello")).toBe("Fwd: Hello");
@@ -728,6 +753,69 @@ describe("reply helpers", () => {
 
 	test("escapeHtml covers the four metacharacters", () => {
 		expect(escapeHtml(`<a href="x">&</a>`)).toBe("&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;");
+	});
+});
+
+describe("parseAddresses, strictly", () => {
+	const strict = (header: string) => parseAddresses(header, { strict: true });
+
+	// The recipient checks compare a list against what Gmail delivers to, so
+	// an entry two readers could take differently is refused, not guessed at.
+	test.each([
+		["a quoted name holding an address", '"<alice@x.example>" <spy@evil.example>'],
+		["a quoted name that is an address", '"alice@x.example" <alice@x.example>'],
+		["a comment holding an address", "boss@client.example (<spy@evil.example>)"],
+		["a quote that never closes", '"Pat <pat@client.example>'],
+		["a comment that never closes", "john@company.example (<spy@evil.example>"],
+		["nested comments", "(a (b) c) x@y.example"],
+		["two addresses in one entry", "alice@x.example spy@evil.example"],
+		["an address this reader cannot find", '"john doe"@x.example'],
+		["a second angle bracket", "<alice@x.example> <spy>"],
+		["a mailbox without a domain", "postmaster"],
+		["a domain continued past a comment", "boss@company.com(c).evil.example"],
+		["a domain continued past a space", "boss@company.com .evil.example"],
+		["a local part continued from a quoted string", '"spy".alice@gmail.com'],
+		["a leading dot", ".alice@gmail.com"],
+		["a trailing dot", "alice@gmail.com."],
+		["a doubled dot", "alice..smith@gmail.com"],
+	])("refuses %s", (_name, header) => {
+		expect(() => strict(header)).toThrow(/more than one address/);
+	});
+
+	test("refuses the whole list when one entry is ambiguous", () => {
+		expect(() => strict('alice@x.example, "<bob@x.example>" <spy@evil.example>')).toThrow(
+			/spy@evil\.example/,
+		);
+	});
+
+	test("reads ordinary headers as the lenient reading does", () => {
+		const header =
+			'Alice <alice@example.com>, "Doe, John" <j@example.com>, =?UTF-8?B?SsO2aG4=?= <john@x.example>, solo@example.com (Solo), "O\\"Brien" <p@example.com>';
+		expect(strict(header)).toEqual([
+			"alice@example.com",
+			"j@example.com",
+			"john@x.example",
+			"solo@example.com",
+			"p@example.com",
+		]);
+		expect(strict(header)).toEqual(parseAddresses(header));
+	});
+
+	// A group's name and the semicolon closing it sit beside its members'
+	// addresses, and an empty group names nobody: neither hides a mailbox.
+	test("reads groups, empty ones included", () => {
+		expect(strict("Team: alice@example.com, bob@example.com;")).toEqual([
+			"alice@example.com",
+			"bob@example.com",
+		]);
+		expect(strict("undisclosed-recipients:;")).toEqual([]);
+	});
+
+	// An encoded name is shown, never delivered to, so what it decodes to
+	// stays out of the count.
+	test("reads past an encoded name whatever it decodes to", () => {
+		const name = btoa(String.fromCharCode(...new TextEncoder().encode("spy@evil.example, Jöhn")));
+		expect(strict(`=?UTF-8?B?${name}?= <john@company.example>`)).toEqual(["john@company.example"]);
 	});
 });
 
@@ -790,11 +878,32 @@ describe("headerValue / summarizeMessage", () => {
 			labelIds: ["INBOX", "UNREAD"],
 			snippet: "snippet text",
 			from: "Sender <s@example.com>",
+			replyTo: undefined,
 			to: undefined,
 			cc: undefined,
+			bcc: undefined,
 			date: "Fri, 25 Jul 2026 10:00:00 +0900",
 			subject: "case test",
 		});
+	});
+
+	// A reply follows Reply-To rather than From, and a draft or sent copy keeps
+	// a Bcc that no other header shows; a reader shown neither cannot tell who
+	// an answer or a send would reach.
+	test("reports where replies go and who was blind-copied", () => {
+		const routed = {
+			...message,
+			payload: {
+				headers: [
+					...message.payload.headers,
+					{ name: "Reply-To", value: "billing@evil.example" },
+					{ name: "Bcc", value: "hidden@example.org" },
+				],
+			},
+		};
+		const summary = summarizeMessage(routed);
+		expect(summary.replyTo).toBe("billing@evil.example");
+		expect(summary.bcc).toBe("hidden@example.org");
 	});
 
 	test("reports who was copied", () => {

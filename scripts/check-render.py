@@ -24,7 +24,7 @@ for f in ["README.md", "docs/SETUP.md", "SECURITY.md"]:
     # &, < and > come back as entities, so compare the text a reader sees
     strongs = {unescape(re.sub(r"<[^>]+>", "", s)) for s in re.findall(r"<strong>(.*?)</strong>", html, re.S)}
     for b in re.findall(r"\*\*([^*\n]+)\*\*", src_no_code):
-        key = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", b).replace("`", "").strip()
+        key = unescape(re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", b).replace("`", "")).strip()
         if not key:
             continue
         if not any(key in s or s in key for s in strongs):

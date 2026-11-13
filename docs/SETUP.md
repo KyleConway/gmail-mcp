@@ -150,7 +150,7 @@ Check your work with `./node_modules/.bin/wrangler secret list`. Secrets take ef
 5. Hit **Add**, then **Connect**.
 6. The Worker shows an approval dialog naming the client (Claude). Hit **Approve**.
 7. Pick your Google account.
-8. Google says **Google hasn't verified this app**. Of course it hasn't; it's yours. Hit **Advanced**, then **Go to <your app name> (unsafe)**.
+8. Google says **Google hasn't verified this app**. Of course it hasn't; it's yours. Hit **Advanced**, then **Go to &lt;your app name&gt; (unsafe)**.
 9. On the permissions screen, leave every box ticked, Gmail included, and hit **Continue**.
 10. You land back in Claude, connected.
 
